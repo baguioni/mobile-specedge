@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -64,18 +66,48 @@ public:
     std::vector<llama_token> Generate(int32_t req_idx);
 
 private:
+    // Per-round target-phase timings (milliseconds) and counters, gathered
+    // by ValidateChain and forwarded to the result log. Mirrors the `stats`
+    // dict specexec.py's _validate_tree returns, minus the proactive-draft
+    // booleans, which have no analogue in this linear client.
+    struct TargetStats {
+        double preprocess_ms = 0.0;   // building the Validate request buffers
+        double wait_ms = 0.0;         // blocked on the Validate RPC
+        double postprocess_ms = 0.0;  // acceptance check + chain / KV fix-up
+        int32_t prefill_cnt = 0;      // ValidateResponse.prefill for this batch
+        int32_t num_accepted_tokens = 0;
+    };
+
+    // Port of specexec.py's _cycle: one draft + verify round. Times the
+    // draft and target phases end to end, appends one JSONL result record,
+    // and returns the tokens committed this round.
+    std::vector<llama_token> RunCycle(int32_t req_idx, int32_t step_idx, bool prefill);
+
     // Drafts up to config_.chain_len tokens greedily, appending each to
-    // chain_. Runs engine_.prefill() first when prefill is true. Returns
-    // the number of tokens actually drafted (may be less than
+    // chain_. Runs engine_.prefill() first when prefill is true. Appends
+    // one wall-clock forward time (ms) per drafted token to forward_ms.
+    // Returns the number of tokens actually drafted (may be less than
     // config_.chain_len near max_len).
-    int32_t GrowChain(bool prefill);
+    int32_t GrowChain(bool prefill, std::vector<double>& forward_ms);
 
     // Sends the just-drafted chain (config_.chain_len tokens, or fewer if
     // GrowChain hit max_len) to the target for verification, accepts the
     // longest matching prefix, appends the bonus token, and truncates both
     // chain_ and the engine's KV cache back to the accepted boundary.
-    // Returns the newly committed tokens (accepted draft tokens + bonus).
-    std::vector<llama_token> ValidateChain(int32_t req_idx, bool prefill, int32_t draft_len);
+    // Fills stats with the phase timings and counters. Returns the newly
+    // committed tokens (accepted draft tokens + bonus).
+    std::vector<llama_token> ValidateChain(
+        int32_t req_idx, bool prefill, int32_t draft_len, TargetStats& stats);
+
+    // Appends one result record -- the 11 fields portable from specexec.py's
+    // _cycle result-logger call -- to log/client_<client_idx>.jsonl.
+    void LogCycle(
+        int32_t req_idx,
+        int32_t step_idx,
+        const std::vector<double>& draft_forward_ms,
+        double draft_end_to_end_ms,
+        const TargetStats& stats,
+        double target_end_to_end_ms);
 
     LlamaCppEngine& engine_;
     GrpcClient& validator_;
@@ -87,6 +119,13 @@ private:
     // generations). Always equal to chain_.end() between rounds; diverges
     // from it only while GrowChain is actively drafting.
     int32_t confirmed_len_ = 0;
+
+    // Shared, process-wide result sink: truncated the first time this
+    // process opens it, appended to thereafter. script/client.cpp builds
+    // one SpecClient per request, so every round of every request in a run
+    // writes through the same handle -- the lifecycle log.py's
+    // ResultHandler + QueueListener give the Python client's jsonl.
+    std::shared_ptr<std::ofstream> result_log_;
 };
 
 } // namespace specedge

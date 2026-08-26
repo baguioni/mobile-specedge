@@ -75,7 +75,7 @@ GrpcClient::ValidateResult GrpcClient::Validate(
 
     ValidateResult result;
     result.selection = Decode<int64_t>(response.selection());
-    result.prefill = response.prefill() != 0;
+    result.prefill = response.prefill();
     return result;
 }
 

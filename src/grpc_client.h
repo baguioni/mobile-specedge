@@ -40,7 +40,12 @@ public:
         // Wire dtype is fixed by the server contract (torch.long on the
         // Python side), independent of whatever width input_ids etc. use.
         std::vector<int64_t> selection;
-        bool prefill = false;
+        // Number of prefill requests the server bundled into the batch that
+        // served this call (ValidateResponse.prefill, i.e. grpc.py's
+        // returned `prefill_cnt`). 0 on a pure decode round; kept as the
+        // count rather than a bool so it matches specexec.py's
+        // target.prefill result field.
+        int32_t prefill = 0;
     };
 
     explicit GrpcClient(const std::string& host);
