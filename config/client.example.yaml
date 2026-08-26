@@ -1,0 +1,41 @@
+# Config for the batch client (src/script/client.cpp -> `client` binary).
+#
+# Run:  ./build/client --config config/client.example.yaml
+# Invoke from the project root: datasets are read from ./data and model
+# paths are resolved relative to the current working directory.
+
+client:
+  # GGUF draft model run locally through llama.cpp.
+  draft_model: models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf
+  # Layers to offload to GPU (-1 = all, 0 = CPU only).
+  n_gpu_layers: 0
+  main_gpu: 0
+  # Thread counts; null lets llama.cpp pick its default.
+  n_threads: null
+  n_threads_batch: null
+
+  # Address of the running SpecEdgeService target.
+  host: 127.0.0.1:8000
+  # Context budget shared by prompt + generation.
+  max_len: 2048
+  # Tokens drafted (and verified in one round) per speculative step.
+  chain_len: 16
+  # Tokens to generate per request (stops early on end-of-generation).
+  max_new_tokens: 64
+  # Seeds the per-client shuffle of the request order.
+  client_idx: 0
+
+  # Dataset name. Read from data/<name>_prompts.json, except specbench which
+  # is data/specbench_prompts.jsonl (chat-templated).
+  # One of: mtbench, c4, oasst, wikitext, specbench.
+  dataset: mtbench
+  # Only affects specbench (enable_thinking on the chat template); ignored
+  # by this client since llama.cpp's template has no thinking toggle.
+  reasoning: false
+  # -1 = whole dataset, otherwise an absolute upper index (matches client.py:
+  # slice is dataset[req_offset : max_request_num]).
+  max_request_num: -1
+
+  req_offset: 0
+  # Take every Nth prompt after the offset (1 = every prompt).
+  sample_req_cnt: 1

@@ -32,7 +32,24 @@ FetchContent_Declare(
 )
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(llama_cpp nlohmann_json)
+# YAML parser for the batch client's config file (src/script/client.cpp).
+# yaml-cpp 0.8.0 still ships cmake_minimum_required(VERSION 3.4), which
+# CMake >= 4.0 rejects; this lets its (and only its) sub-configure proceed.
+# llama.cpp and nlohmann_json declare their own >= 3.5 minimums, so this
+# does not weaken their builds.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+FetchContent_Declare(
+  yaml_cpp
+  GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
+  GIT_TAG        0.8.0
+  GIT_SHALLOW    TRUE
+)
+set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_INSTALL OFF CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(llama_cpp nlohmann_json yaml_cpp)
 
 # gRPC/Protobuf are consumed from the system install (see src/specedge_grpc/,
 # pre-generated from specedge.proto with a matching protoc/grpc_cpp_plugin
@@ -59,3 +76,9 @@ target_link_libraries(parity_test PRIVATE graph_engine_lib)
 
 add_executable(linear_client src/client_main.cpp)
 target_link_libraries(linear_client PRIVATE graph_engine_lib)
+
+# Config-driven batch client: reads a YAML config, walks a whole dataset,
+# runs each prompt through chain speculative decoding. Port of
+# specedge/src/script/client.py.
+add_executable(client src/script/client.cpp)
+target_link_libraries(client PRIVATE graph_engine_lib yaml-cpp::yaml-cpp)

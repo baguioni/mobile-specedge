@@ -82,6 +82,10 @@ public:
     // Exposed so callers can tokenize/detokenize prompts themselves, the
     // same way graph.py leaves tokenization to an external HF tokenizer.
     const llama_vocab* vocab() const { return vocab_; }
+    // Exposed so callers can apply the GGUF's built-in chat template to raw
+    // dataset prompts (see src/script/client.cpp), mirroring vocab()'s
+    // "text handling is the caller's job" rationale.
+    const llama_model* model() const { return model_; }
 
 private:
     void load_model(const Config& config);

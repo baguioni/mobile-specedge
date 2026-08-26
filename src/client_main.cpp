@@ -139,36 +139,45 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    specedge::LlamaCppEngine::Config engine_config;
-    engine_config.model_path = args.model_path;
-    engine_config.max_len = args.max_len;
-    engine_config.max_n_beams = 1;
-    engine_config.n_gpu_layers = args.n_gpu_layers;
-    engine_config.n_threads = args.n_threads;
-    engine_config.n_threads_batch = args.n_threads_batch;
-    engine_config.role = "linear_client";
+    try {
+        specedge::LlamaCppEngine::Config engine_config;
+        engine_config.model_path = args.model_path;
+        engine_config.max_len = args.max_len;
+        engine_config.max_n_beams = 1;
+        engine_config.n_gpu_layers = args.n_gpu_layers;
+        engine_config.n_threads = args.n_threads;
+        engine_config.n_threads_batch = args.n_threads_batch;
+        engine_config.role = "linear_client";
 
-    specedge::LlamaCppEngine engine(engine_config);
-    specedge::GrpcClient validator(args.host);
+        specedge::LlamaCppEngine engine(engine_config);
+        specedge::GrpcClient validator(args.host);
 
-    std::vector<llama_token> prompt_tokens = tokenize(engine.vocab(), args.prompt, /*add_bos=*/true);
-    if (static_cast<int32_t>(prompt_tokens.size()) + args.max_new_tokens > args.max_len) {
-        std::fprintf(stderr,
-            "Warning: %zu prompt tokens + %d generated tokens exceeds --max-len=%d; "
-            "decode will fail once the context fills up.\n",
-            prompt_tokens.size(), args.max_new_tokens, args.max_len);
+        std::vector<llama_token> prompt_tokens = tokenize(engine.vocab(), args.prompt, /*add_bos=*/true);
+        if (static_cast<int32_t>(prompt_tokens.size()) + args.max_new_tokens > args.max_len) {
+            std::fprintf(stderr,
+                "Warning: %zu prompt tokens + %d generated tokens exceeds --max-len=%d; "
+                "decode will fail once the context fills up.\n",
+                prompt_tokens.size(), args.max_new_tokens, args.max_len);
+        }
+
+        specedge::SpecClient::Config client_config;
+        client_config.chain_len = args.chain_len;
+        client_config.max_new_tokens = args.max_new_tokens;
+        client_config.client_idx = args.client_idx;
+
+        specedge::SpecClient client(engine, validator, prompt_tokens, args.prompt, client_config);
+
+        std::vector<llama_token> generated = client.Generate(args.req_idx);
+
+        std::printf("Prompt: %s\n", args.prompt.c_str());
+        std::printf("Completion: %s\n", detokenize(engine.vocab(), generated).c_str());
+        return 0;
+    } catch (const std::exception& e) {
+        // Anything from model loading, the gRPC channel (e.g. the target
+        // unreachable/not started yet), or decoding surfaces as a plain
+        // C++ exception -- report it and exit cleanly instead of letting
+        // it unwind past main() into an abort/backtrace.
+        std::fprintf(stderr, "linear_client: fatal error: %s\n", e.what());
+        return 1;
     }
-
-    specedge::SpecClient::Config client_config;
-    client_config.chain_len = args.chain_len;
-    client_config.max_new_tokens = args.max_new_tokens;
-    client_config.client_idx = args.client_idx;
-
-    specedge::SpecClient client(engine, validator, prompt_tokens, args.prompt, client_config);
-
-    std::vector<llama_token> generated = client.Generate(args.req_idx);
-
-    std::printf("Prompt: %s\n", args.prompt.c_str());
-    std::printf("Completion: %s\n", detokenize(engine.vocab(), generated).c_str());
-    return 0;
 }
