@@ -20,6 +20,7 @@ namespace {
 struct Args {
     std::string model_path = "models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf";
     std::string host = "localhost:50555";
+    std::string dtype = "fp16";  // attention_mask wire dtype; match the server
     std::string prompt = "The capital of France is";
     int32_t max_len = 256;
     int32_t max_n_beams = 4;
@@ -50,6 +51,7 @@ void print_usage(const char* argv0) {
         "Usage: %s [options]\n"
         "  --model <path>            GGUF draft model path\n"
         "  --host <host:port>        SpecEdgeService target address (default: %s)\n"
+        "  --dtype <fp32|fp16|bf16>  attention_mask wire dtype (default: fp16)\n"
         "  --prompt <text>           Prompt to complete\n"
         "  --max-len <n>             Context / max_len (default: 256)\n"
         "  --max-n-beams <n>         Candidates expanded per draft step (default: 4)\n"
@@ -84,6 +86,9 @@ bool parse_args(int argc, char** argv, Args& args) {
         } else if (arg == "--host") {
             if (!(value = next_value(i))) { std::fprintf(stderr, "--host needs a value\n"); return false; }
             args.host = *value;
+        } else if (arg == "--dtype") {
+            if (!(value = next_value(i))) { std::fprintf(stderr, "--dtype needs a value\n"); return false; }
+            args.dtype = *value;
         } else if (arg == "--prompt") {
             if (!(value = next_value(i))) { std::fprintf(stderr, "--prompt needs a value\n"); return false; }
             args.prompt = *value;
@@ -183,6 +188,8 @@ int main(int argc, char** argv) {
 
         specedge::LlamaCppEngine engine(engine_config);
         specedge::GrpcClient validator(args.host);
+        validator.attention_mask_dtype =
+            specedge::GrpcClient::ParseMaskDType(args.dtype);
 
         std::vector<llama_token> prompt_tokens = tokenize(engine.vocab(), args.prompt, /*add_bos=*/true);
         if (static_cast<int32_t>(prompt_tokens.size()) + args.max_new_tokens > args.max_len) {

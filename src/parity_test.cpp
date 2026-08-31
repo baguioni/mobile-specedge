@@ -8,6 +8,9 @@
 
 int main() {
     specedge::GrpcClient client("localhost:50555");
+    // Pin the mask wire dtype so this stays byte-comparable with whatever
+    // run_python_client.py sends; bump both sides together if that changes.
+    client.attention_mask_dtype = specedge::GrpcClient::MaskDType::kFP32;
 
     std::vector<llama_token> input_ids = {101, 102, 103};
     std::vector<llama_pos> position_ids = {0, 1, 2};

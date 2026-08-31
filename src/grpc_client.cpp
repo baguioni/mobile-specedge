@@ -33,11 +33,49 @@ std::vector<T> Decode(const std::string& bytes) {
     return values;
 }
 
+// attention_mask always arrives as fp32 values; the server decodes it as
+// its configured model dtype, so narrow to that width here (the proto has
+// no dtype tag). ggml_fp32_to_{fp16,bf16}_row give the same rounding as the
+// torch cast the Python client's mask tensor went through.
+std::string EncodeMask(
+    const std::vector<float>& mask, GrpcClient::MaskDType dtype) {
+    switch (dtype) {
+        case GrpcClient::MaskDType::kFP16: {
+            std::vector<ggml_fp16_t> half(mask.size());
+            if (!mask.empty()) {
+                ggml_fp32_to_fp16_row(
+                    mask.data(), half.data(), static_cast<int64_t>(mask.size()));
+            }
+            return Encode(half);
+        }
+        case GrpcClient::MaskDType::kBF16: {
+            std::vector<ggml_bf16_t> bf(mask.size());
+            if (!mask.empty()) {
+                ggml_fp32_to_bf16_row(
+                    mask.data(), bf.data(), static_cast<int64_t>(mask.size()));
+            }
+            return Encode(bf);
+        }
+        case GrpcClient::MaskDType::kFP32:
+            break;
+    }
+    return Encode(mask);
+}
+
 } // namespace
 
 GrpcClient::GrpcClient(const std::string& host)
     : channel_(grpc::CreateChannel(host, grpc::InsecureChannelCredentials())),
       stub_(SpecEdgeService::NewStub(channel_)) {}
+
+// Mirrors util.convert_dtype on the Python side.
+GrpcClient::MaskDType GrpcClient::ParseMaskDType(const std::string& name) {
+    if (name == "fp32") return MaskDType::kFP32;
+    if (name == "fp16") return MaskDType::kFP16;
+    if (name == "bf16") return MaskDType::kBF16;
+    throw std::invalid_argument(
+        "GrpcClient::ParseMaskDType: expected fp32, fp16, or bf16, got '" + name + "'");
+}
 
 GrpcClient::ValidateResult GrpcClient::Validate(
     int32_t client_idx,
@@ -60,7 +98,7 @@ GrpcClient::ValidateResult GrpcClient::Validate(
     request.set_position_ids(EncodeWiden<int64_t>(position_ids));
     request.set_cache_seq_indices(EncodeWiden<int64_t>(cache_seq_indices));
     request.set_parent_indices(EncodeWiden<int64_t>(parent_indices));
-    request.set_attention_mask(Encode(attention_mask));
+    request.set_attention_mask(EncodeMask(attention_mask, attention_mask_dtype));
     request.set_prefill(prefill);
     if (prefix.has_value()) {
         request.set_prefix(*prefix);

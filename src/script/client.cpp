@@ -58,6 +58,9 @@ struct ClientConfig {
     // target + decoding (SpecExec drafting parameters, see
     // spec_exec_client.h)
     std::string host = "localhost:50555";
+    // attention_mask wire dtype; must equal the server's base.dtype since
+    // the proto carries no dtype tag. One of fp32, fp16, bf16.
+    std::string dtype = "fp16";
     int32_t max_len = 2048;
     int32_t max_n_beams = 4;
     int32_t max_beam_len = 8;
@@ -112,6 +115,7 @@ ClientConfig load_config(const std::string& path) {
     }
 
     c.host = node_or<std::string>(cl["host"], c.host);
+    c.dtype = node_or<std::string>(cl["dtype"], c.dtype);
     c.max_len = node_or<int32_t>(cl["max_len"], c.max_len);
     c.max_n_beams = node_or<int32_t>(cl["max_n_beams"], c.max_n_beams);
     c.max_beam_len = node_or<int32_t>(cl["max_beam_len"], c.max_beam_len);
@@ -129,6 +133,10 @@ ClientConfig load_config(const std::string& path) {
 
     if (c.draft_model.empty()) {
         throw std::runtime_error("config: model.draft_model is required");
+    }
+    if (c.dtype != "fp32" && c.dtype != "fp16" && c.dtype != "bf16") {
+        throw std::runtime_error(
+            "config: client.dtype must be one of fp32, fp16, bf16");
     }
     if (c.max_n_beams < 1 || c.max_beam_len < 1 || c.max_branch_width < 1 ||
         c.max_budget < 1) {
@@ -319,6 +327,8 @@ int main(int argc, char** argv) {
         specedge::LlamaCppEngine engine(engine_config);
         specedge::GrpcClient validator(cfg.host);
         validator.client_idx = cfg.client_idx;
+        validator.attention_mask_dtype =
+            specedge::GrpcClient::ParseMaskDType(cfg.dtype);
 
         const std::vector<std::string> dataset =
             load_dataset(cfg.dataset, engine.model(), cfg.reasoning);

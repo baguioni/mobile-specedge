@@ -23,11 +23,13 @@ namespace specedge {
 //  - Wire widths are fixed by the server contract, independent of the local
 //    types llama.cpp uses: the server decodes input_ids, position_ids,
 //    cache_seq_indices, and parent_indices as torch.long (int64_t), even
-//    though llama.cpp's own llama_token/llama_pos are int32_t locally, and
-//    attention_mask as a float tensor (the model's dtype), never an integer
-//    type. Validate() upcasts the int32_t fields to int64_t and expects
-//    attention_mask already as float before serializing, so its wire bytes
-//    match what the server (and the Python client) actually send/expect.
+//    though llama.cpp's own llama_token/llama_pos are int32_t locally.
+//    Validate() upcasts those int32_t fields to int64_t before serializing.
+//    attention_mask is different: the server decodes it as its configured
+//    model dtype (fp16/bf16/fp32) and the proto carries no dtype tag, so
+//    the caller passes fp32 values and Validate() narrows them to
+//    attention_mask_dtype (see below), which must be set to match the
+//    server's base.dtype the same way the Python client's mask tensor is.
 //  - No device parameter: results land in host memory (std::vector); this
 //    project doesn't route tensors through a GPU tensor library.
 //  - Synchronous instead of grpc.aio: nothing else in this project runs an
@@ -56,16 +58,29 @@ public:
     // may inspect/set it.
     int32_t client_idx = 0;
 
+    // Wire encoding for the attention_mask bytes. The proto has no dtype
+    // tag, so this must match the server's configured model dtype
+    // (base.dtype / SPECEDGE_DTYPE on the server) out of band, exactly as
+    // the Python client relies on its mask tensor already being in
+    // config.dtype. Only attention_mask is affected -- the index fields go
+    // out as torch.long (int64) regardless. Defaults to fp16, the server's
+    // usual setting; set kFP32 for an fp32 server (e.g. mobile.example.yaml).
+    enum class MaskDType { kFP32, kFP16, kBF16 };
+    MaskDType attention_mask_dtype = MaskDType::kFP16;
+
+    // Maps "fp32" / "fp16" / "bf16" (the server's base.dtype spelling) to
+    // the matching MaskDType. Throws std::invalid_argument on anything else.
+    static MaskDType ParseMaskDType(const std::string& name);
+
     // Throws std::invalid_argument if prefill is true and prefix is unset,
     // matching the Python ValueError. Throws std::runtime_error if the RPC
     // itself fails.
     //
-    // attention_mask must already be in the server's configured model dtype
-    // as far as bit width goes; this sends it as 32-bit float (fp32). If a
-    // deployment configures the server with SPECEDGE_DTYPE=fp16 or bf16,
-    // this needs to encode 16-bit elements instead - the wire format has no
-    // dtype tag, so client and server widths must be arranged to match out
-    // of band, same as on the Python side.
+    // attention_mask is passed as fp32 values regardless of the wire dtype;
+    // Validate() narrows them to attention_mask_dtype (default fp16) before
+    // serializing. That field must match the server's configured model
+    // dtype - the wire format has no dtype tag, so the widths are arranged
+    // to match out of band, same as on the Python side.
     ValidateResult Validate(
         int32_t client_idx,
         int32_t req_idx,
