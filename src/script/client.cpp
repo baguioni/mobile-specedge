@@ -5,8 +5,8 @@
 // max_len, decoding params, dataset selection) and then walks the entire
 // dataset: it builds the request-index list the same way client.py does
 // (offset slice -> stride subsample -> seeded shuffle) and feeds each prompt
-// through chain speculative decoding against a running SpecEdgeService
-// target, one request at a time.
+// through tree-based (SpecExec) speculative decoding against a running
+// SpecEdgeService target, one request at a time.
 //
 // Differences from client.py, by design:
 //  - Config comes from a YAML file parsed here, not from environment
@@ -15,8 +15,6 @@
 //    under a single `client:` key.
 //  - Datasets are always read from ./data (the project layout), so there is
 //    no configurable data directory.
-//  - The linear SpecClient (chain decoding) is used, matching this repo's
-//    port; client.py's tree-based SpecExecClient has no analogue here.
 //  - No stub.Sync() handshake before the loop: GrpcClient exposes only
 //    Validate(); the first Validate() of each request carries prefill=true,
 //    which is what the server keys off.
@@ -44,7 +42,7 @@
 
 #include "graph_engine.h"
 #include "grpc_client.h"
-#include "spec_client.h"
+#include "spec_exec_client.h"
 
 namespace {
 
@@ -57,10 +55,15 @@ struct ClientConfig {
     std::optional<uint32_t> n_threads;
     std::optional<uint32_t> n_threads_batch;
 
-    // target + decoding
+    // target + decoding (SpecExec drafting parameters, see
+    // spec_exec_client.h)
     std::string host = "localhost:50555";
     int32_t max_len = 2048;
-    int32_t chain_len = 4;
+    int32_t max_n_beams = 4;
+    int32_t max_beam_len = 8;
+    int32_t max_branch_width = 2;
+    int32_t max_budget = 16;
+    int32_t max_seqs = 0;  // llama.cpp sequences; 0 = derive from the above
     int32_t max_new_tokens = 64;
     int32_t client_idx = 0;
 
@@ -110,7 +113,11 @@ ClientConfig load_config(const std::string& path) {
 
     c.host = node_or<std::string>(cl["host"], c.host);
     c.max_len = node_or<int32_t>(cl["max_len"], c.max_len);
-    c.chain_len = node_or<int32_t>(cl["chain_len"], c.chain_len);
+    c.max_n_beams = node_or<int32_t>(cl["max_n_beams"], c.max_n_beams);
+    c.max_beam_len = node_or<int32_t>(cl["max_beam_len"], c.max_beam_len);
+    c.max_branch_width = node_or<int32_t>(cl["max_branch_width"], c.max_branch_width);
+    c.max_budget = node_or<int32_t>(cl["max_budget"], c.max_budget);
+    c.max_seqs = node_or<int32_t>(cl["max_seqs"], c.max_seqs);
     c.max_new_tokens = node_or<int32_t>(cl["max_new_tokens"], c.max_new_tokens);
     c.client_idx = node_or<int32_t>(cl["client_idx"], c.client_idx);
 
@@ -123,6 +130,12 @@ ClientConfig load_config(const std::string& path) {
     if (c.draft_model.empty()) {
         throw std::runtime_error("config: model.draft_model is required");
     }
+    if (c.max_n_beams < 1 || c.max_beam_len < 1 || c.max_branch_width < 1 ||
+        c.max_budget < 1) {
+        throw std::runtime_error(
+            "config: max_n_beams, max_beam_len, max_branch_width and "
+            "max_budget must all be >= 1");
+    }
     if (c.sample_req_cnt < 1) {
         throw std::runtime_error("config: dataset.sample_req_cnt must be >= 1");
     }
@@ -130,6 +143,16 @@ ClientConfig load_config(const std::string& path) {
         throw std::runtime_error("config: dataset.max_request_num must be -1 or >= 0");
     }
     return c;
+}
+
+// Upper bound on llama.cpp sequences a round can fork: every draft step can
+// split each expanded beam into (width - 1) fresh branches, plus the
+// canonical seq 0. Clamped to llama.cpp's LLAMA_MAX_SEQ.
+int32_t derive_max_seqs(const ClientConfig& cfg) {
+    const int64_t forks = 1 +
+        static_cast<int64_t>(cfg.max_beam_len) * cfg.max_n_beams *
+            (cfg.max_branch_width - 1);
+    return static_cast<int32_t>(std::clamp<int64_t>(forks, 2, 256));
 }
 
 std::vector<llama_token> tokenize(const llama_vocab* vocab, const std::string& text, bool add_bos) {
@@ -285,12 +308,13 @@ int main(int argc, char** argv) {
         specedge::LlamaCppEngine::Config engine_config;
         engine_config.model_path = cfg.draft_model;
         engine_config.max_len = cfg.max_len;
-        engine_config.max_n_beams = 1;
+        engine_config.max_n_beams = cfg.max_n_beams;
+        engine_config.max_seqs = cfg.max_seqs > 0 ? cfg.max_seqs : derive_max_seqs(cfg);
         engine_config.n_gpu_layers = cfg.n_gpu_layers;
         engine_config.main_gpu = cfg.main_gpu;
         engine_config.n_threads = cfg.n_threads;
         engine_config.n_threads_batch = cfg.n_threads_batch;
-        engine_config.role = "linear_client";
+        engine_config.role = "tree_client";
 
         specedge::LlamaCppEngine engine(engine_config);
         specedge::GrpcClient validator(cfg.host);
@@ -324,12 +348,15 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            specedge::SpecClient::Config client_config;
-            client_config.chain_len = cfg.chain_len;
+            specedge::SpecExecClient::Config client_config;
+            client_config.max_n_beams = cfg.max_n_beams;
+            client_config.max_beam_len = cfg.max_beam_len;
+            client_config.max_branch_width = cfg.max_branch_width;
+            client_config.max_budget = cfg.max_budget;
             client_config.max_new_tokens = cfg.max_new_tokens;
             client_config.client_idx = cfg.client_idx;
 
-            specedge::SpecClient client(
+            specedge::SpecExecClient client(
                 engine, validator, prompt_tokens, prompt, client_config);
             const std::vector<llama_token> generated = client.Generate(req_idx);
 

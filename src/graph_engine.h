@@ -12,8 +12,22 @@
 
 namespace specedge {
 
-// C++ port of graph.py's LlamaCppEngine. Drives a single llama.cpp sequence
-// (seq_id 0) for linear (non-tree) speculative-decoding drafting.
+// C++ port of graph.py's engine role, on top of llama.cpp's KV cache.
+//
+// Two modes, selected by Config::max_seqs:
+//  - Linear (max_seqs == 1): drives a single llama.cpp sequence (seq_id 0)
+//    for chain drafting -- prefill()/forward()/gather()/backfill().
+//  - Tree (max_seqs > 1): drives one llama.cpp sequence per root-to-leaf
+//    draft branch, the way llama.cpp's examples/speculative/speculative.cpp
+//    does. The context is created with kv_unified = true so all sequences
+//    share one cell pool: a cell can carry several seq tags, seq_cp() is a
+//    tag-only copy (no KV data moves), and the tree attention mask is
+//    *derived* by llama.cpp from (seq tags, pos) -- no mask is ever
+//    injected. Branch forks are seq_cp(), levels are decoded in one batch
+//    via forward_batch(), and acceptance is collapse_to_seq(): keep the
+//    winning branch's cells, retag them onto the canonical seq 0. Cells
+//    never move -- unlike graph.py's gather, which permutes torch cache
+//    rows.
 //
 // Differences from the Python version, by design:
 //  - No torch::Tensor: llama.cpp's own token/position types (llama_token,
@@ -22,14 +36,19 @@ namespace specedge {
 //  - No HF tokenizer object: the vocab-parity check takes a plain expected
 //    vocab size, and forward-log decoding uses llama.cpp's own
 //    llama_detokenize instead of an external tokenizer.
-//  - forward() takes/returns scalars instead of [1, num_beams] tensors,
-//    since num_beams == batch_size == 1 is enforced either way.
+//  - No cache_seq_indices addressing: the Python engine writes KV by tree
+//    slot; llama.cpp cells are addressed by (seq_id, pos). The caller owns
+//    the slot -> (seq, pos) mapping (see tree.h) and passes seq/pos here.
 class LlamaCppEngine {
 public:
     struct Config {
         std::string model_path;
         int32_t max_len = 0;
         int32_t max_n_beams = 1;
+        // Number of llama.cpp sequences (= concurrent draft branches).
+        // 1 selects linear mode; > 1 selects tree mode (kv_unified cache).
+        // llama.cpp caps this at LLAMA_MAX_SEQ (256).
+        int32_t max_seqs = 1;
         int32_t n_gpu_layers = 0;
         int32_t main_gpu = 0;
         std::string role = "unknown";
@@ -49,23 +68,54 @@ public:
     void close();
 
     // Prefills all but the last prompt token (the last token is deferred to
-    // the first forward(), matching the Python implementation). batch_idx
-    // must be 0.
+    // the first forward()/forward_batch(), matching the Python
+    // implementation). batch_idx must be 0. Both modes; commits to seq 0.
     void prefill(
         const std::vector<llama_token>& input_ids,
         const std::vector<llama_pos>& position_ids,
         int32_t batch_idx);
 
-    // Decodes a single token and returns logits over the vocab
-    // (size n_vocab()).
+    // Linear mode only: decodes a single token and returns logits over the
+    // vocab (size n_vocab()).
     std::vector<float> forward(
         llama_token input_id,
         llama_pos position_id,
         int32_t cache_batch_index,
         int32_t cache_seq_index);
 
-    // Prefix-truncation gather: keeps the first dest_indices.size() cache
-    // cells. Only src == dest == arange(n) is supported (no tree drafting).
+    // Tree mode only: decodes one batch of draft nodes -- typically all the
+    // candidates of one tree level -- each row under its own sequence, and
+    // returns the concatenated logits (input_ids.size() rows of n_vocab()
+    // floats, in row order). Rows may share a position as long as their
+    // seq_ids differ; llama.cpp derives the tree mask from (seq tags, pos).
+    // slot_indices carries the rows' tree slots for the forward log only.
+    std::vector<float> forward_batch(
+        const std::vector<llama_token>& input_ids,
+        const std::vector<llama_pos>& position_ids,
+        const std::vector<int32_t>& seq_ids,
+        const std::vector<int32_t>& slot_indices);
+
+    // Tree mode only: forks a draft branch. Under kv_unified this is a
+    // tag-only copy -- every cell of src_seq (the root..fork path) gains
+    // dst_seq's tag, no KV data is copied. Call before the fork's first
+    // sibling is decoded so the copied path is exactly root..parent.
+    void seq_cp(int32_t src_seq_id, int32_t dst_seq_id);
+
+    // Tree mode only: end-of-round acceptance. Keeps only seq_id's cells at
+    // positions [0, last_pos], drops every other branch (a cell whose tag
+    // set empties is freed), and retags the survivors onto the canonical
+    // seq 0 -- the seq_rm/seq_keep/seq_cp/seq_keep pattern of
+    // examples/speculative/speculative.cpp. Cells never move.
+    void collapse_to_seq(int32_t seq_id, llama_pos last_pos);
+
+    // Tree mode only: decodes one token without returning logits. Used to
+    // backfill the deepest accepted node when it was a never-decoded
+    // CANDIDATE leaf (the tree analogue of linear backfill()).
+    void decode_token(llama_token token, llama_pos pos, int32_t seq_id);
+
+    // Linear mode only. Prefix-truncation gather: keeps the first
+    // dest_indices.size() cache cells. Only src == dest == arange(n) is
+    // supported; tree acceptance goes through collapse_to_seq() instead.
     void gather(
         const std::vector<int32_t>& src_indices,
         const std::vector<int32_t>& dest_indices);
@@ -79,6 +129,8 @@ public:
     int32_t n_vocab() const { return n_vocab_; }
     int32_t max_len() const { return max_len_; }
     int32_t seq_len() const { return seq_len_; }
+    int32_t max_seqs() const { return max_seqs_; }
+    bool tree_mode() const { return tree_mode_; }
     // Exposed so callers can tokenize/detokenize prompts themselves, the
     // same way graph.py leaves tokenization to an external HF tokenizer.
     const llama_vocab* vocab() const { return vocab_; }
@@ -105,9 +157,13 @@ private:
     void log_info(const char* fmt, ...) const;
     void log_warn(const char* fmt, ...) const;
 
+    void require_mode(bool tree, const char* method) const;
+
     std::string role_;
     int32_t max_len_ = 0;
     int32_t max_n_beams_ = 1;
+    int32_t max_seqs_ = 1;
+    bool tree_mode_ = false;
 
     int32_t seq_len_ = 0;
     // (position, predicted_token) for the bonus token the draft model

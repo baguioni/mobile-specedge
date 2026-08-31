@@ -60,8 +60,8 @@ find_package(gRPC CONFIG REQUIRED)
 add_library(graph_engine_lib
   src/graph_engine.cpp
   src/grpc_client.cpp
-  src/chain.cpp
-  src/spec_client.cpp
+  src/tree.cpp
+  src/spec_exec_client.cpp
   src/specedge_grpc/specedge.pb.cc
   src/specedge_grpc/specedge.grpc.pb.cc
 )
@@ -74,11 +74,11 @@ target_link_libraries(graph_engine PRIVATE graph_engine_lib)
 add_executable(parity_test src/parity_test.cpp)
 target_link_libraries(parity_test PRIVATE graph_engine_lib)
 
-add_executable(linear_client src/client_main.cpp)
-target_link_libraries(linear_client PRIVATE graph_engine_lib)
+add_executable(tree_client src/client_main.cpp)
+target_link_libraries(tree_client PRIVATE graph_engine_lib)
 
 # Config-driven batch client: reads a YAML config, walks a whole dataset,
-# runs each prompt through chain speculative decoding. Port of
-# specedge/src/script/client.py.
+# runs each prompt through tree-based (SpecExec) speculative decoding. Port
+# of specedge/src/script/client.py.
 add_executable(client src/script/client.cpp)
 target_link_libraries(client PRIVATE graph_engine_lib yaml-cpp::yaml-cpp)

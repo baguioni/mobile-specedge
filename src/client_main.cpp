@@ -1,8 +1,9 @@
-// Minimal CLI for SpecClient (spec_client.h): tokenizes a
-// prompt, runs it through chain speculative decoding against a running
+// Minimal CLI for SpecExecClient (spec_exec_client.h): tokenizes a
+// prompt, runs it through tree-based speculative decoding against a running
 // SpecEdgeService target, and prints the result. Mirrors main.cpp's role
 // for GraphEngine -- proves the client links and round-trips against a real
 // server, not a unit test suite.
+#include <algorithm>
 #include <cstdio>
 #include <exception>
 #include <optional>
@@ -12,7 +13,7 @@
 #include "llama.h"
 #include "graph_engine.h"
 #include "grpc_client.h"
-#include "spec_client.h"
+#include "spec_exec_client.h"
 
 namespace {
 
@@ -21,7 +22,11 @@ struct Args {
     std::string host = "localhost:50555";
     std::string prompt = "The capital of France is";
     int32_t max_len = 256;
-    int32_t chain_len = 4;
+    int32_t max_n_beams = 4;
+    int32_t max_beam_len = 8;
+    int32_t max_branch_width = 2;
+    int32_t max_budget = 16;
+    int32_t max_seqs = 0;  // 0 = derive from the drafting parameters
     int32_t max_new_tokens = 32;
     int32_t client_idx = 0;
     int32_t req_idx = 0;
@@ -30,6 +35,16 @@ struct Args {
     std::optional<uint32_t> n_threads_batch;
 };
 
+// Upper bound on llama.cpp sequences a round can fork: every draft step can
+// split each expanded beam into (width - 1) fresh branches, plus the
+// canonical seq 0. Clamped to llama.cpp's LLAMA_MAX_SEQ.
+int32_t derive_max_seqs(const Args& args) {
+    const int64_t forks = 1 +
+        static_cast<int64_t>(args.max_beam_len) * args.max_n_beams *
+            (args.max_branch_width - 1);
+    return static_cast<int32_t>(std::clamp<int64_t>(forks, 2, 256));
+}
+
 void print_usage(const char* argv0) {
     std::fprintf(stderr,
         "Usage: %s [options]\n"
@@ -37,7 +52,11 @@ void print_usage(const char* argv0) {
         "  --host <host:port>        SpecEdgeService target address (default: %s)\n"
         "  --prompt <text>           Prompt to complete\n"
         "  --max-len <n>             Context / max_len (default: 256)\n"
-        "  --chain-len <n>           Tokens drafted per round (default: 4)\n"
+        "  --max-n-beams <n>         Candidates expanded per draft step (default: 4)\n"
+        "  --max-beam-len <n>        Draft steps (tree depth) per round (default: 8)\n"
+        "  --max-branch-width <n>    Children sampled per candidate (default: 2)\n"
+        "  --max-budget <n>          Draft-node budget per round (default: 16)\n"
+        "  --max-seqs <n>            llama.cpp sequences (default: 0 = auto)\n"
         "  --max-new-tokens <n>      Tokens to generate (default: 32)\n"
         "  --n-gpu-layers <n>        Layers to offload to GPU, -1 for all (default: 0)\n"
         "  --n-threads <n>           Decode thread count\n"
@@ -71,9 +90,21 @@ bool parse_args(int argc, char** argv, Args& args) {
         } else if (arg == "--max-len") {
             if (!(value = next_value(i))) { std::fprintf(stderr, "--max-len needs a value\n"); return false; }
             args.max_len = std::stoi(*value);
-        } else if (arg == "--chain-len") {
-            if (!(value = next_value(i))) { std::fprintf(stderr, "--chain-len needs a value\n"); return false; }
-            args.chain_len = std::stoi(*value);
+        } else if (arg == "--max-n-beams") {
+            if (!(value = next_value(i))) { std::fprintf(stderr, "--max-n-beams needs a value\n"); return false; }
+            args.max_n_beams = std::stoi(*value);
+        } else if (arg == "--max-beam-len") {
+            if (!(value = next_value(i))) { std::fprintf(stderr, "--max-beam-len needs a value\n"); return false; }
+            args.max_beam_len = std::stoi(*value);
+        } else if (arg == "--max-branch-width") {
+            if (!(value = next_value(i))) { std::fprintf(stderr, "--max-branch-width needs a value\n"); return false; }
+            args.max_branch_width = std::stoi(*value);
+        } else if (arg == "--max-budget") {
+            if (!(value = next_value(i))) { std::fprintf(stderr, "--max-budget needs a value\n"); return false; }
+            args.max_budget = std::stoi(*value);
+        } else if (arg == "--max-seqs") {
+            if (!(value = next_value(i))) { std::fprintf(stderr, "--max-seqs needs a value\n"); return false; }
+            args.max_seqs = std::stoi(*value);
         } else if (arg == "--max-new-tokens") {
             if (!(value = next_value(i))) { std::fprintf(stderr, "--max-new-tokens needs a value\n"); return false; }
             args.max_new_tokens = std::stoi(*value);
@@ -106,7 +137,7 @@ std::vector<llama_token> tokenize(const llama_vocab* vocab, const std::string& t
     return tokens;
 }
 
-// See spec_client.cpp's Detokenize() for why this needs a fallback:
+// See spec_exec_client.cpp's Detokenize() for why this needs a fallback:
 // a misbehaving/test target can hand back a token id with no piece data,
 // which llama.cpp reports as an uncaught std::out_of_range.
 std::string detokenize(const llama_vocab* vocab, const std::vector<llama_token>& tokens) {
@@ -143,11 +174,12 @@ int main(int argc, char** argv) {
         specedge::LlamaCppEngine::Config engine_config;
         engine_config.model_path = args.model_path;
         engine_config.max_len = args.max_len;
-        engine_config.max_n_beams = 1;
+        engine_config.max_n_beams = args.max_n_beams;
+        engine_config.max_seqs = args.max_seqs > 0 ? args.max_seqs : derive_max_seqs(args);
         engine_config.n_gpu_layers = args.n_gpu_layers;
         engine_config.n_threads = args.n_threads;
         engine_config.n_threads_batch = args.n_threads_batch;
-        engine_config.role = "linear_client";
+        engine_config.role = "tree_client";
 
         specedge::LlamaCppEngine engine(engine_config);
         specedge::GrpcClient validator(args.host);
@@ -160,12 +192,15 @@ int main(int argc, char** argv) {
                 prompt_tokens.size(), args.max_new_tokens, args.max_len);
         }
 
-        specedge::SpecClient::Config client_config;
-        client_config.chain_len = args.chain_len;
+        specedge::SpecExecClient::Config client_config;
+        client_config.max_n_beams = args.max_n_beams;
+        client_config.max_beam_len = args.max_beam_len;
+        client_config.max_branch_width = args.max_branch_width;
+        client_config.max_budget = args.max_budget;
         client_config.max_new_tokens = args.max_new_tokens;
         client_config.client_idx = args.client_idx;
 
-        specedge::SpecClient client(engine, validator, prompt_tokens, args.prompt, client_config);
+        specedge::SpecExecClient client(engine, validator, prompt_tokens, args.prompt, client_config);
 
         std::vector<llama_token> generated = client.Generate(args.req_idx);
 
@@ -177,7 +212,7 @@ int main(int argc, char** argv) {
         // unreachable/not started yet), or decoding surfaces as a plain
         // C++ exception -- report it and exit cleanly instead of letting
         // it unwind past main() into an abort/backtrace.
-        std::fprintf(stderr, "linear_client: fatal error: %s\n", e.what());
+        std::fprintf(stderr, "tree_client: fatal error: %s\n", e.what());
         return 1;
     }
 }

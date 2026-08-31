@@ -18,8 +18,20 @@ client:
   host: 127.0.0.1:8000
   # Context budget shared by prompt + generation.
   max_len: 2048
-  # Tokens drafted (and verified in one round) per speculative step.
-  chain_len: 16
+  # SpecExec tree-drafting parameters (see spec_exec_client.h). Note the
+  # server sizes its buffers from its own max_budget: keep this max_budget
+  # equal to the server's SPECEDGE_MAX_BUDGET.
+  # Candidates expanded per draft step.
+  max_n_beams: 4
+  # Draft steps (max tree depth added) per round.
+  max_beam_len: 8
+  # Children sampled per expanded candidate.
+  max_branch_width: 2
+  # Draft-node budget per round.
+  max_budget: 16
+  # llama.cpp sequences (concurrent draft branches); null/0 derives an upper
+  # bound from the parameters above. Capped at 256 (LLAMA_MAX_SEQ).
+  max_seqs: null
   # Tokens to generate per request (stops early on end-of-generation).
   max_new_tokens: 64
   # Seeds the per-client shuffle of the request order.

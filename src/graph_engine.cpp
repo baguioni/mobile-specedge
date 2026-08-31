@@ -85,12 +85,24 @@ void log_line(const char* level, const std::string& role, const char* fmt, va_li
 } // namespace
 
 LlamaCppEngine::LlamaCppEngine(Config config)
-    : role_(config.role), max_len_(config.max_len), max_n_beams_(config.max_n_beams) {
-    if (max_n_beams_ != 1) {
+    : role_(config.role),
+      max_len_(config.max_len),
+      max_n_beams_(config.max_n_beams),
+      max_seqs_(config.max_seqs),
+      tree_mode_(config.max_seqs > 1) {
+    if (max_n_beams_ < 1) {
         throw std::invalid_argument(
-            "LlamaCppEngine supports linear drafting only (max_n_beams must "
-            "be 1, got " + std::to_string(max_n_beams_) + "). llama.cpp has "
-            "no API for injecting a custom tree attention mask.");
+            "LlamaCppEngine: max_n_beams must be >= 1, got " + std::to_string(max_n_beams_));
+    }
+    // llama.cpp's hard sequence cap (LLAMA_MAX_SEQ); checked here so the
+    // failure names the config knob instead of an internal assert.
+    if (max_seqs_ < 1 || max_seqs_ > 256) {
+        throw std::invalid_argument(
+            "LlamaCppEngine: max_seqs must be in [1, 256], got " + std::to_string(max_seqs_));
+    }
+    if (!tree_mode_ && max_n_beams_ != 1) {
+        throw std::invalid_argument(
+            "LlamaCppEngine: max_n_beams > 1 requires tree mode (max_seqs > 1).");
     }
 
     forward_log_ = get_forward_log_stream();
@@ -127,16 +139,20 @@ void LlamaCppEngine::load_model(const Config& config) {
     n_vocab_ = llama_vocab_n_tokens(vocab_);
     check_vocab_parity(config.expected_vocab_size);
 
-    // This engine drives a single llama.cpp sequence (seq_id 0), so only
-    // one parallel sequence slot is ever needed.
-    constexpr int32_t n_seq_max = 1;
+    // Linear mode drives a single llama.cpp sequence (seq_id 0). Tree mode
+    // needs one sequence per concurrent draft branch, and a *unified* KV
+    // buffer: with kv_unified = true all sequences share one cell pool
+    // (n_ctx cells total, not divided per sequence), a cell can carry
+    // several seq tags, and llama_memory_seq_cp is a tag-only copy -- the
+    // whole basis of the branch-fork scheme (see seq_cp()).
+    const int32_t n_seq_max = max_seqs_;
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = static_cast<uint32_t>(max_len_);
     ctx_params.n_batch = static_cast<uint32_t>(max_len_);
     ctx_params.n_ubatch = std::min<uint32_t>(ctx_params.n_batch, 512);
     ctx_params.n_seq_max = n_seq_max;
-    ctx_params.kv_unified = false;
+    ctx_params.kv_unified = tree_mode_;
 
     if (config.n_threads.has_value()) {
         ctx_params.n_threads = static_cast<int32_t>(*config.n_threads);
@@ -168,7 +184,9 @@ void LlamaCppEngine::load_model(const Config& config) {
             ". Lower max_len or raise the context budget.");
     }
 
-    // One token belongs to exactly one sequence in linear mode.
+    // Every decoded token carries exactly one seq id in both modes: tree
+    // forks are tag-only seq_cp()s of already-committed cells, never
+    // multi-seq batch rows.
     batch_ = llama_batch_init(static_cast<int32_t>(ctx_params.n_batch), 0, 1);
     batch_allocated_ = true;
     n_batch_ = static_cast<int32_t>(ctx_params.n_batch);
@@ -253,8 +271,18 @@ void LlamaCppEngine::log_forward(
         return;
     }
 
-    int32_t argmax_id = static_cast<int32_t>(
-        std::max_element(logits.begin(), logits.end()) - logits.begin());
+    // One argmax per logits row (linear forward passes a single row).
+    const int64_t n_rows = static_cast<int64_t>(input_ids.size());
+    std::vector<int32_t> argmax_ids;
+    std::vector<llama_token> argmax_tokens;
+    argmax_ids.reserve(n_rows);
+    for (int64_t r = 0; r < n_rows; ++r) {
+        auto row_begin = logits.begin() + r * n_vocab_;
+        int32_t argmax_id = static_cast<int32_t>(
+            std::max_element(row_begin, row_begin + n_vocab_) - row_begin);
+        argmax_ids.push_back(argmax_id);
+        argmax_tokens.push_back(static_cast<llama_token>(argmax_id));
+    }
 
     nlohmann::json entry;
     entry["engine"] = "LlamaCppEngine";
@@ -265,11 +293,11 @@ void LlamaCppEngine::log_forward(
     entry["input_ids"] = input_ids;
     entry["position_ids"] = position_ids;
     entry["cache_seq_indices"] = cache_seq_indices;
-    entry["logits_shape"] = std::vector<int64_t>{1, 1, n_vocab_};
+    entry["logits_shape"] = std::vector<int64_t>{1, n_rows, n_vocab_};
     entry["logits_dtype"] = "float32";
-    entry["argmax_token_ids"] = std::vector<int32_t>{argmax_id};
+    entry["argmax_token_ids"] = argmax_ids;
     entry["input_string"] = detokenize(input_ids);
-    entry["argmax_string"] = detokenize({static_cast<llama_token>(argmax_id)});
+    entry["argmax_string"] = detokenize(argmax_tokens);
 
     std::lock_guard<std::mutex> lock(g_forward_log_mutex);
     *forward_log_ << entry.dump() << "\n";
@@ -311,6 +339,104 @@ std::vector<float> LlamaCppEngine::read_logits(int32_t n_rows) const {
 void LlamaCppEngine::seq_rm(int32_t seq_id, int32_t p0, int32_t p1) {
     // Drop cells of seq_id in [p0, p1); p1 < 0 means "to end".
     llama_memory_seq_rm(memory_, seq_id, p0, p1);
+}
+
+void LlamaCppEngine::require_mode(bool tree, const char* method) const {
+    if (tree != tree_mode_) {
+        throw std::logic_error(
+            std::string("LlamaCppEngine::") + method + " is " +
+            (tree ? "tree" : "linear") + "-mode only, but the engine was "
+            "configured with max_seqs=" + std::to_string(max_seqs_) + ".");
+    }
+}
+
+std::vector<float> LlamaCppEngine::forward_batch(
+    const std::vector<llama_token>& input_ids,
+    const std::vector<llama_pos>& position_ids,
+    const std::vector<int32_t>& seq_ids,
+    const std::vector<int32_t>& slot_indices) {
+    require_mode(/*tree=*/true, "forward_batch");
+
+    const int32_t n = static_cast<int32_t>(input_ids.size());
+    if (n == 0) {
+        throw std::invalid_argument("forward_batch: empty batch");
+    }
+    if (position_ids.size() != input_ids.size() || seq_ids.size() != input_ids.size() ||
+        slot_indices.size() != input_ids.size()) {
+        throw std::invalid_argument("forward_batch: inconsistent input sizes");
+    }
+    if (n > n_batch_) {
+        throw std::invalid_argument(
+            "forward_batch: " + std::to_string(n) + " rows exceeds n_batch=" +
+            std::to_string(n_batch_));
+    }
+
+    for (int32_t i = 0; i < n; ++i) {
+        if (seq_ids[i] < 0 || seq_ids[i] >= max_seqs_) {
+            throw std::invalid_argument(
+                "forward_batch: seq_id " + std::to_string(seq_ids[i]) +
+                " out of [0, max_seqs=" + std::to_string(max_seqs_) + ")");
+        }
+        batch_set(i, input_ids[i], position_ids[i], seq_ids[i], /*want_logits=*/true);
+    }
+    decode(n);
+
+    std::vector<float> logits = read_logits(n);
+    log_forward(input_ids, position_ids, slot_indices, logits);
+    return logits;
+}
+
+void LlamaCppEngine::seq_cp(int32_t src_seq_id, int32_t dst_seq_id) {
+    require_mode(/*tree=*/true, "seq_cp");
+    if (src_seq_id < 0 || src_seq_id >= max_seqs_ || dst_seq_id < 0 || dst_seq_id >= max_seqs_) {
+        throw std::invalid_argument(
+            "seq_cp: seq ids (" + std::to_string(src_seq_id) + ", " +
+            std::to_string(dst_seq_id) + ") out of [0, max_seqs=" +
+            std::to_string(max_seqs_) + ")");
+    }
+    // Tag-only under kv_unified: every cell of src (the root..fork path)
+    // gains dst's tag; no KV data is copied.
+    llama_memory_seq_cp(memory_, src_seq_id, dst_seq_id, -1, -1);
+}
+
+void LlamaCppEngine::collapse_to_seq(int32_t seq_id, llama_pos last_pos) {
+    require_mode(/*tree=*/true, "collapse_to_seq");
+    if (seq_id < 0 || seq_id >= max_seqs_) {
+        throw std::invalid_argument(
+            "collapse_to_seq: seq_id " + std::to_string(seq_id) +
+            " out of [0, max_seqs=" + std::to_string(max_seqs_) + ")");
+    }
+
+    // Same call pattern as llama.cpp examples/speculative/speculative.cpp's
+    // post-verification cleanup:
+    //  1. drop the winning branch's own tail beyond the accepted node
+    //     (rejected chain suffix, or stale cells from pruned sub-branches),
+    //  2. free every cell not on the winning branch,
+    //  3. retag the survivors onto the canonical seq 0,
+    //  4. strip the now-redundant winner tag.
+    llama_memory_seq_rm(memory_, seq_id, last_pos + 1, -1);
+    llama_memory_seq_keep(memory_, seq_id);
+    if (seq_id != 0) {
+        llama_memory_seq_cp(memory_, seq_id, 0, -1, -1);
+    }
+    llama_memory_seq_keep(memory_, 0);
+
+    seq_len_ = last_pos + 1;
+    predicted_.reset();
+}
+
+void LlamaCppEngine::decode_token(llama_token token, llama_pos pos, int32_t seq_id) {
+    require_mode(/*tree=*/true, "decode_token");
+    if (seq_id < 0 || seq_id >= max_seqs_) {
+        throw std::invalid_argument(
+            "decode_token: seq_id " + std::to_string(seq_id) +
+            " out of [0, max_seqs=" + std::to_string(max_seqs_) + ")");
+    }
+    // Logits are requested (llama.cpp's tested decode path always marks the
+    // final batch token) but discarded by the caller.
+    batch_set(0, token, pos, seq_id, /*want_logits=*/true);
+    decode(1);
+    seq_len_ = std::max(seq_len_, pos + 1);
 }
 
 void LlamaCppEngine::prefill(
@@ -364,6 +490,7 @@ void LlamaCppEngine::prefill(
 std::vector<float> LlamaCppEngine::forward(
     llama_token input_id, llama_pos position_id, int32_t cache_batch_index,
     int32_t cache_seq_index) {
+    require_mode(/*tree=*/false, "forward");
     if (cache_batch_index != 0) {
         throw std::invalid_argument(
             "cache_batch_indices maps to seq_id " + std::to_string(cache_batch_index) +
@@ -374,7 +501,7 @@ std::vector<float> LlamaCppEngine::forward(
         throw std::invalid_argument(
             "cache_seq_indices=" + std::to_string(cache_seq_index) +
             " != position_ids=" + std::to_string(position_id) +
-            ". Tree drafting is not supported by LlamaCppEngine.");
+            ". Tree drafting goes through forward_batch() in tree mode.");
     }
     // llama.cpp appends; it cannot overwrite a cell in place. A gap or an
     // overlap here means the KV cache and the tree have diverged.
@@ -382,7 +509,7 @@ std::vector<float> LlamaCppEngine::forward(
         throw std::invalid_argument(
             "Token at position " + std::to_string(position_id) +
             " does not append to a sequence of length " + std::to_string(seq_len_) +
-            ". KV cache and BatchTree are out of sync.");
+            ". KV cache and the draft chain are out of sync.");
     }
 
     batch_set(0, input_id, position_id, /*seq_id=*/0, /*want_logits=*/true);
@@ -429,6 +556,7 @@ void LlamaCppEngine::backfill(int32_t have, int32_t need) {
 
 void LlamaCppEngine::gather(
     const std::vector<int32_t>& src_indices, const std::vector<int32_t>& dest_indices) {
+    require_mode(/*tree=*/false, "gather");
     if (src_indices.empty()) {
         // Nothing was accepted thus drop the sequence.
         seq_rm(0, -1, -1);
