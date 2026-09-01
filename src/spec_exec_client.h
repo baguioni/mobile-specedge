@@ -76,14 +76,29 @@ private:
         int32_t num_accepted_tokens = 0;
     };
 
+    // Per-round draft-phase timings (milliseconds), one entry per tree
+    // level. forward is the engine call; the other three break down the
+    // per-level CPU work _get_next_beams and the fork loop do around it.
+    // All four sum to nearly all of draft.end_to_end -- the remainder is
+    // the joint-budget selection and Tree bookkeeping (tree_.add,
+    // TrimByBudget), which touch O(max_budget) floats rather than the
+    // O(n_beams * n_vocab) the timed spans do.
+    struct DraftStats {
+        std::vector<double> forward_ms;  // engine_.forward_batch
+        std::vector<double> softmax_ms;  // row_max + sum_exp log-softmax denominator
+        std::vector<double> topk_ms;     // TopKIndices over the full vocab
+        std::vector<double> fork_ms;     // seq_cp branch forks + tree_.add
+        std::vector<int32_t> n_beams;    // rows expanded at this level
+    };
+
     // Port of specexec.py's _cycle: one draft + verify round.
     std::vector<llama_token> RunCycle(int32_t req_idx, int32_t step_idx, bool prefill);
 
     // Port of _grow_tree + _process_candidates + _get_next_beams: up to
     // max_beam_len batched draft steps. Runs engine_.prefill() first when
-    // prefill is true. Appends one wall-clock forward time (ms) per draft
-    // step to forward_ms.
-    void GrowTree(bool prefill, std::vector<double>& forward_ms);
+    // prefill is true. Appends one entry per draft step to each of stats'
+    // vectors.
+    void GrowTree(bool prefill, DraftStats& stats);
 
     // Port of _validate_tree: ships the seed + every draft node to the
     // target, walks acceptance from the returned selection exactly the way
@@ -111,7 +126,7 @@ private:
     void LogCycle(
         int32_t req_idx,
         int32_t step_idx,
-        const std::vector<double>& draft_forward_ms,
+        const DraftStats& draft_stats,
         double draft_end_to_end_ms,
         const TargetStats& stats,
         double target_end_to_end_ms);

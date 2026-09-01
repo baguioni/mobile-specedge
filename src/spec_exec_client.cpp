@@ -241,9 +241,9 @@ std::vector<llama_token> SpecExecClient::Generate(int32_t req_idx) {
 
 std::vector<llama_token> SpecExecClient::RunCycle(int32_t req_idx, int32_t step_idx, bool prefill) {
     // Draft phase: specexec.py wraps _grow_tree in util.Timing("sync").
-    std::vector<double> draft_forward_ms;
+    DraftStats draft_stats;
     SteadyClock::time_point draft_start = SteadyClock::now();
-    GrowTree(prefill, draft_forward_ms);
+    GrowTree(prefill, draft_stats);
     double draft_end_to_end_ms = MillisSince(draft_start);
 
     // Target phase: wraps _validate_tree in util.Timing("sync").
@@ -253,7 +253,7 @@ std::vector<llama_token> SpecExecClient::RunCycle(int32_t req_idx, int32_t step_
     double target_end_to_end_ms = MillisSince(target_start);
 
     LogCycle(
-        req_idx, step_idx, draft_forward_ms, draft_end_to_end_ms, stats, target_end_to_end_ms);
+        req_idx, step_idx, draft_stats, draft_end_to_end_ms, stats, target_end_to_end_ms);
 
     return fresh_tokens;
 }
@@ -270,8 +270,12 @@ int32_t SpecExecClient::AllocSeq() {
     return next_seq_++;
 }
 
-void SpecExecClient::GrowTree(bool prefill, std::vector<double>& forward_ms) {
-    forward_ms.clear();
+void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
+    stats.forward_ms.clear();
+    stats.softmax_ms.clear();
+    stats.topk_ms.clear();
+    stats.fork_ms.clear();
+    stats.n_beams.clear();
 
     // Mirrors _grow_tree's "no candidates -> skip growth" guard.
     bool has_candidate = false;
@@ -338,7 +342,8 @@ void SpecExecClient::GrowTree(bool prefill, std::vector<double>& forward_ms) {
         // position because each lives on its own sequence.
         SteadyClock::time_point forward_start = SteadyClock::now();
         std::vector<float> logits = engine_.forward_batch(in_tokens, in_pos, in_seqs, candidates);
-        forward_ms.push_back(MillisSince(forward_start));
+        stats.forward_ms.push_back(MillisSince(forward_start));
+        stats.n_beams.push_back(n_beams);
 
         std::vector<float> beam_scores(n_beams);
         std::vector<llama_pos> beam_positions(n_beams);
@@ -352,11 +357,17 @@ void SpecExecClient::GrowTree(bool prefill, std::vector<double>& forward_ms) {
         const int32_t n_flat = n_beams * width;
         std::vector<llama_token> flat_ids(n_flat);
         std::vector<float> flat_scores(n_flat);
+        // Both spans below are O(n_beams * n_vocab) scalar sweeps; a clock
+        // pair per beam costs tens of nanoseconds against their tens of
+        // milliseconds, so the instrumentation is free at this scale.
+        double softmax_acc = 0.0;
+        double topk_acc = 0.0;
         for (int32_t b = 0; b < n_beams; ++b) {
             const float* row = logits.data() + static_cast<size_t>(b) * n_vocab;
 
             // log_softmax denominator; top-k over raw logits equals top-k
             // over logprobs (the shift is per-row constant).
+            SteadyClock::time_point softmax_start = SteadyClock::now();
             float row_max = row[0];
             for (int32_t v = 1; v < n_vocab; ++v) {
                 row_max = std::max(row_max, row[v]);
@@ -366,14 +377,22 @@ void SpecExecClient::GrowTree(bool prefill, std::vector<double>& forward_ms) {
                 sum_exp += std::exp(static_cast<double>(row[v]) - row_max);
             }
             const float log_z = row_max + static_cast<float>(std::log(sum_exp));
+            softmax_acc += MillisSince(softmax_start);
 
+            SteadyClock::time_point topk_start = SteadyClock::now();
             std::vector<int32_t> top = TopKIndices(row, n_vocab, width);
+            topk_acc += MillisSince(topk_start);
+
             for (int32_t k = 0; k < width; ++k) {
                 const int32_t f = b * width + k;
                 flat_ids[f] = static_cast<llama_token>(top[k]);
                 flat_scores[f] = beam_scores[b] + kDecayFactor + (row[top[k]] - log_z);
             }
         }
+        // Pushed before the budget/keep block so these stay the same length
+        // as forward_ms whichever exit the level takes below.
+        stats.softmax_ms.push_back(softmax_acc);
+        stats.topk_ms.push_back(topk_acc);
 
         const int32_t n_existing = tree_.end() - tree_.prefix_len();
         const int32_t joint_size = n_existing + n_flat;
@@ -415,6 +434,7 @@ void SpecExecClient::GrowTree(bool prefill, std::vector<double>& forward_ms) {
 
         if (keep.empty()) {
             std::fprintf(stderr, "[SpecExecClient] No more beams to grow\n");
+            stats.fork_ms.push_back(0.0);  // level ends before any fork
             break;
         }
 
@@ -427,6 +447,7 @@ void SpecExecClient::GrowTree(bool prefill, std::vector<double>& forward_ms) {
             }
             if (!CheckNewTokenInBudget(kept_scores)) {
                 std::fprintf(stderr, "[SpecExecClient] Max budget reached. early stopping\n");
+                stats.fork_ms.push_back(0.0);  // level ends before any fork
                 break;
             }
         }
@@ -437,6 +458,7 @@ void SpecExecClient::GrowTree(bool prefill, std::vector<double>& forward_ms) {
         // fresh one with a tag-only seq_cp of the root..parent path. The
         // forks happen before any child is decoded, so the copied path is
         // exactly root..parent.
+        SteadyClock::time_point fork_start = SteadyClock::now();
         std::vector<llama_token> child_ids;
         std::vector<llama_pos> child_pos;
         std::vector<int32_t> child_parents;
@@ -462,6 +484,7 @@ void SpecExecClient::GrowTree(bool prefill, std::vector<double>& forward_ms) {
         }
         tree_.add(child_ids, child_pos, child_parents, child_logprobs, child_seqs,
                   Tree::kCandidate);
+        stats.fork_ms.push_back(MillisSince(fork_start));
     }
 
     if (tree_.end() - tree_.prefix_len() >= config_.max_budget) {
@@ -713,7 +736,7 @@ std::vector<llama_token> SpecExecClient::ValidateTree(
 void SpecExecClient::LogCycle(
     int32_t req_idx,
     int32_t step_idx,
-    const std::vector<double>& draft_forward_ms,
+    const DraftStats& draft_stats,
     double draft_end_to_end_ms,
     const TargetStats& stats,
     double target_end_to_end_ms) {
@@ -724,8 +747,22 @@ void SpecExecClient::LogCycle(
     entry["client_idx"] = config_.client_idx;
     entry["req_idx"] = req_idx;
     entry["step_idx"] = step_idx;
-    entry["draft"]["forward"] = draft_forward_ms;
+    entry["draft"]["forward"] = draft_stats.forward_ms;
+    entry["draft"]["softmax"] = draft_stats.softmax_ms;
+    entry["draft"]["topk"] = draft_stats.topk_ms;
+    entry["draft"]["fork"] = draft_stats.fork_ms;
+    entry["draft"]["n_beams"] = draft_stats.n_beams;
     entry["draft"]["end_to_end"] = draft_end_to_end_ms;
+    // What draft.end_to_end holds that the four spans above do not: the
+    // candidate scan, the joint-budget nth_element, and TrimByBudget. All
+    // are O(max_budget), so a residual anywhere near the spans means the
+    // cost is somewhere this breakdown does not yet look.
+    const auto sum = [](const std::vector<double>& v) {
+        return std::accumulate(v.begin(), v.end(), 0.0);
+    };
+    entry["draft"]["residual"] =
+        draft_end_to_end_ms - sum(draft_stats.forward_ms) - sum(draft_stats.softmax_ms) -
+        sum(draft_stats.topk_ms) - sum(draft_stats.fork_ms);
     entry["target"]["client_preprocess"] = stats.preprocess_ms;
     entry["target"]["client_wait"] = stats.wait_ms;
     entry["target"]["client_postprocess"] = stats.postprocess_ms;
