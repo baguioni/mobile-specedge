@@ -15,6 +15,12 @@ client:
   max_seqs: null
   max_new_tokens: 64
   client_idx: 0
+  # Score the draft tree on the GPU: softmax + top-k become nodes in the
+  # decode graph, and llama.cpp stops copying raw logits back to the host
+  # (~19 MB per tree level at 32 beams). Requires a backend with soft_max
+  # and top_k kernels. Off by default -- the llama.cpp backend sampling
+  # API it uses is marked EXPERIMENTAL.
+  backend_topk: false
   dataset: specbench
   reasoning: false
   max_request_num: -1

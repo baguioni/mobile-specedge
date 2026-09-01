@@ -291,6 +291,18 @@ void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
     const int32_t width = config_.max_branch_width;
     const int32_t n_vocab = engine_.n_vocab();
 
+    // Backend scoring is on when the engine was built with a top-k sampler.
+    // Its k has to be exactly the branch width: the sampler decides how many
+    // children each beam gets, and flat_ids/flat_scores below are indexed
+    // b * width + k against what it returns.
+    const bool backend_topk = engine_.draft_top_k() > 0;
+    if (backend_topk && engine_.draft_top_k() != width) {
+        throw std::runtime_error(
+            "SpecExecClient: engine draft_top_k=" + std::to_string(engine_.draft_top_k()) +
+            " does not match max_branch_width=" + std::to_string(width) +
+            ". Configure the engine with draft_top_k = max_branch_width.");
+    }
+
     for (int32_t cnt = 0; cnt < max_beam_len; ++cnt) {
         // ---- _process_candidates ----
         std::vector<int32_t> candidates;
@@ -340,8 +352,18 @@ void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
 
         // One llama_decode for the whole tree level: rows may share a
         // position because each lives on its own sequence.
+        // With a backend sampler attached the softmax and top-k are graph
+        // nodes, so they are inside this span rather than after it, and only
+        // width ids + log-probs per row come back instead of a full
+        // n_vocab row.
         SteadyClock::time_point forward_start = SteadyClock::now();
-        std::vector<float> logits = engine_.forward_batch(in_tokens, in_pos, in_seqs, candidates);
+        std::vector<float> logits;
+        LlamaCppEngine::TopKRows top;
+        if (backend_topk) {
+            top = engine_.forward_batch_topk(in_tokens, in_pos, in_seqs, candidates);
+        } else {
+            logits = engine_.forward_batch(in_tokens, in_pos, in_seqs, candidates);
+        }
         stats.forward_ms.push_back(MillisSince(forward_start));
         stats.n_beams.push_back(n_beams);
 
@@ -357,11 +379,28 @@ void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
         const int32_t n_flat = n_beams * width;
         std::vector<llama_token> flat_ids(n_flat);
         std::vector<float> flat_scores(n_flat);
-        // Both spans below are O(n_beams * n_vocab) scalar sweeps; a clock
-        // pair per beam costs tens of nanoseconds against their tens of
-        // milliseconds, so the instrumentation is free at this scale.
+        // On the host path both spans below are O(n_beams * n_vocab) scalar
+        // sweeps; a clock pair per beam costs tens of nanoseconds against
+        // their tens of milliseconds, so the instrumentation is free at this
+        // scale. On the backend path both stay zero and the work shows up in
+        // forward instead -- which is the whole point, and why the two paths
+        // are kept side by side rather than one replacing the other.
         double softmax_acc = 0.0;
         double topk_acc = 0.0;
+        if (backend_topk) {
+            // engine_ returns exactly width entries per row, already in
+            // (row, rank) order -- the same layout as flat_ids/flat_scores --
+            // and already normalized over the full vocabulary, so the score
+            // is just the parent's plus the decay plus this log-prob.
+            for (int32_t b = 0; b < n_beams; ++b) {
+                for (int32_t k = 0; k < width; ++k) {
+                    const int32_t f = b * width + k;
+                    flat_ids[f] = top.ids[static_cast<size_t>(f)];
+                    flat_scores[f] =
+                        beam_scores[b] + kDecayFactor + top.logprobs[static_cast<size_t>(f)];
+                }
+            }
+        } else {
         for (int32_t b = 0; b < n_beams; ++b) {
             const float* row = logits.data() + static_cast<size_t>(b) * n_vocab;
 
@@ -402,14 +441,15 @@ void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
             softmax_acc += MillisSince(softmax_start);
 
             SteadyClock::time_point topk_start = SteadyClock::now();
-            std::vector<int32_t> top = TopKIndices(row, n_vocab, width);
+            std::vector<int32_t> top_ids = TopKIndices(row, n_vocab, width);
             topk_acc += MillisSince(topk_start);
 
             for (int32_t k = 0; k < width; ++k) {
                 const int32_t f = b * width + k;
-                flat_ids[f] = static_cast<llama_token>(top[k]);
-                flat_scores[f] = beam_scores[b] + kDecayFactor + (row[top[k]] - log_z);
+                flat_ids[f] = static_cast<llama_token>(top_ids[k]);
+                flat_scores[f] = beam_scores[b] + kDecayFactor + (row[top_ids[k]] - log_z);
             }
+        }
         }
         // Pushed before the budget/keep block so these stay the same length
         // as forward_ms whichever exit the level takes below.

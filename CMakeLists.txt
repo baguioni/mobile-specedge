@@ -68,6 +68,7 @@ src/graph_engine.cpp
 src/grpc_client.cpp
 src/tree.cpp
 src/spec_exec_client.cpp
+src/topk_sampler.cpp
 src/specedge_grpc/specedge.pb.cc
 src/specedge_grpc/specedge.grpc.pb.cc
 )

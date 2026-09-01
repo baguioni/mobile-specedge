@@ -57,6 +57,12 @@ public:
         // every visible CUDA device. Only meaningful with a GPU build and
         // n_gpu_layers != 0.
         bool single_gpu = true;
+        // Tree mode only. When > 0, a backend top-k sampler (topk_sampler.h)
+        // is attached to every sequence, forward_batch_topk() becomes usable,
+        // and llama.cpp stops copying raw logits to the host. Set it to the
+        // draft's branch width. 0 leaves sampling on the host and only
+        // forward_batch() works.
+        int32_t draft_top_k = 0;
         std::string role = "unknown";
         // Optional external vocab size (e.g. an HF tokenizer's vocab_size)
         // to sanity-check against the GGUF's own vocab. Skipped if unset.
@@ -101,6 +107,29 @@ public:
         const std::vector<int32_t>& seq_ids,
         const std::vector<int32_t>& slot_indices);
 
+    // Per-row top-k result of forward_batch_topk(). ids[r*k + j] and
+    // logprobs[r*k + j] are the j-th best continuation of input row r and
+    // its log-probability under the *full* vocabulary distribution -- the
+    // same quantity log_softmax(logits).topk(k) yields, so scores stay
+    // comparable across rows.
+    struct TopKRows {
+        int32_t k = 0;
+        int32_t n_rows = 0;
+        std::vector<llama_token> ids;
+        std::vector<float> logprobs;
+    };
+
+    // Tree mode with Config::draft_top_k > 0 only. Same decode as
+    // forward_batch(), but the softmax and top-k run on the backend as part
+    // of the decode graph, and only k ids + k probabilities per row come
+    // back instead of a full n_vocab row. For a 151,936-entry vocabulary at
+    // 32 beams that is ~19 MB per level replaced by ~4 KB.
+    TopKRows forward_batch_topk(
+        const std::vector<llama_token>& input_ids,
+        const std::vector<llama_pos>& position_ids,
+        const std::vector<int32_t>& seq_ids,
+        const std::vector<int32_t>& slot_indices);
+
     // Tree mode only: forks a draft branch. Under kv_unified this is a
     // tag-only copy -- every cell of src_seq (the root..fork path) gains
     // dst_seq's tag, no KV data is copied. Call before the fork's first
@@ -137,6 +166,10 @@ public:
     int32_t seq_len() const { return seq_len_; }
     int32_t max_seqs() const { return max_seqs_; }
     bool tree_mode() const { return tree_mode_; }
+    // > 0 when a backend sampler is attached, i.e. forward_batch_topk() is
+    // available and forward_batch() is not (llama.cpp no longer copies raw
+    // logits back). Lets callers keep a host-scoring path for comparison.
+    int32_t draft_top_k() const { return draft_top_k_; }
     // Exposed so callers can tokenize/detokenize prompts themselves, the
     // same way graph.py leaves tokenization to an external HF tokenizer.
     const llama_vocab* vocab() const { return vocab_; }
@@ -158,6 +191,11 @@ private:
         const std::vector<llama_pos>& position_ids,
         const std::vector<int32_t>& cache_seq_indices,
         const std::vector<float>& logits) const;
+    void log_forward_topk(
+        const std::vector<llama_token>& input_ids,
+        const std::vector<llama_pos>& position_ids,
+        const std::vector<int32_t>& cache_seq_indices,
+        const TopKRows& top) const;
     std::string detokenize(const std::vector<llama_token>& tokens) const;
 
     void log_info(const char* fmt, ...) const;
@@ -169,6 +207,11 @@ private:
     int32_t max_len_ = 0;
     int32_t max_n_beams_ = 1;
     int32_t max_seqs_ = 1;
+    // Config::draft_top_k, and one backend sampler per sequence when it is
+    // set. llama_context_params::samplers holds borrowed pointers, so these
+    // must outlive ctx_ -- they are freed after llama_free() in close().
+    int32_t draft_top_k_ = 0;
+    std::vector<llama_sampler*> samplers_;
     bool tree_mode_ = false;
 
     int32_t seq_len_ = 0;

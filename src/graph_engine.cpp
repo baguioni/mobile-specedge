@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -12,6 +13,8 @@
 #include <unordered_map>
 
 #include <nlohmann/json.hpp>
+
+#include "topk_sampler.h"
 
 namespace specedge {
 
@@ -89,7 +92,14 @@ LlamaCppEngine::LlamaCppEngine(Config config)
       max_len_(config.max_len),
       max_n_beams_(config.max_n_beams),
       max_seqs_(config.max_seqs),
+      draft_top_k_(config.draft_top_k),
       tree_mode_(config.max_seqs > 1) {
+    if (draft_top_k_ > 0 && config.max_seqs <= 1) {
+        throw std::invalid_argument(
+            "LlamaCppEngine: draft_top_k requires tree mode (max_seqs > 1). "
+            "Linear mode's forward() returns full logits and has no backend "
+            "sampler attached.");
+    }
     if (max_n_beams_ < 1) {
         throw std::invalid_argument(
             "LlamaCppEngine: max_n_beams must be >= 1, got " + std::to_string(max_n_beams_));
@@ -168,6 +178,31 @@ void LlamaCppEngine::load_model(const Config& config) {
         ctx_params.n_threads_batch = static_cast<int32_t>(*config.n_threads);
     }
 
+    // One backend top-k sampler per sequence. llama.cpp only skips its
+    // raw-logits device->host copy when *every* output sequence has one
+    // (needs_raw_logits() in llama-context.cpp returns true the moment it
+    // finds an output token on a sequence without a sampler), so this
+    // covers all of [0, n_seq_max) rather than just the ones in use.
+    std::vector<llama_sampler_seq_config> sampler_configs;
+    if (draft_top_k_ > 0) {
+        samplers_.reserve(static_cast<size_t>(n_seq_max));
+        sampler_configs.reserve(static_cast<size_t>(n_seq_max));
+        for (int32_t seq = 0; seq < n_seq_max; ++seq) {
+            llama_sampler* smpl = make_topk_logprob_sampler(draft_top_k_);
+            if (smpl == nullptr) {
+                throw std::runtime_error("Failed to create backend top-k sampler");
+            }
+            samplers_.push_back(smpl);
+            sampler_configs.push_back(llama_sampler_seq_config{seq, smpl});
+        }
+        // Borrowed pointers: the array only has to outlive this call, but
+        // the samplers themselves must outlive ctx_ (freed in close()).
+        ctx_params.samplers = sampler_configs.data();
+        ctx_params.n_samplers = sampler_configs.size();
+        log_info("Backend top-k sampler attached to %d sequences (k=%d); "
+                 "raw logits stay on device", n_seq_max, draft_top_k_);
+    }
+
     ctx_ = llama_init_from_model(model_, ctx_params);
     if (ctx_ == nullptr) {
         throw std::runtime_error("Failed to create llama_context");
@@ -229,6 +264,11 @@ void LlamaCppEngine::close() {
         llama_free(ctx_);
         ctx_ = nullptr;
     }
+    // After llama_free: the context holds borrowed sampler pointers.
+    for (llama_sampler* smpl : samplers_) {
+        llama_sampler_free(smpl);
+    }
+    samplers_.clear();
     if (model_ != nullptr) {
         llama_model_free(model_);
         model_ = nullptr;
@@ -308,6 +348,52 @@ void LlamaCppEngine::log_forward(
     // detokenize() can return a piece that ends mid-UTF-8-character (a single
     // draft/argmax token is often half a multi-byte codepoint); the default
     // dump() throws type_error.316 on that. Replace bad bytes instead.
+    *forward_log_ << entry.dump(-1, ' ', false,
+                                nlohmann::json::error_handler_t::replace)
+                  << "\n";
+    forward_log_->flush();
+}
+
+void LlamaCppEngine::log_forward_topk(
+    const std::vector<llama_token>& input_ids,
+    const std::vector<llama_pos>& position_ids,
+    const std::vector<int32_t>& cache_seq_indices,
+    const TopKRows& top) const {
+    if (!forward_log_) {
+        return;
+    }
+
+    // Same record shape as log_forward, except the argmax comes from the
+    // sampler's best candidate rather than a host scan -- the full logits
+    // row no longer exists on this side of the bus.
+    std::vector<int32_t> argmax_ids;
+    std::vector<llama_token> argmax_tokens;
+    argmax_ids.reserve(static_cast<size_t>(top.n_rows));
+    for (int32_t r = 0; r < top.n_rows; ++r) {
+        const llama_token best = top.ids[static_cast<size_t>(r) * top.k];
+        argmax_ids.push_back(static_cast<int32_t>(best));
+        argmax_tokens.push_back(best);
+    }
+
+    nlohmann::json entry;
+    entry["engine"] = "LlamaCppEngine";
+    entry["role"] = role_;
+    entry["timestamp"] = iso8601_now_local();
+    entry["graph_replay"] = false;
+    entry["num_beams"] = input_ids.size();
+    entry["input_ids"] = input_ids;
+    entry["position_ids"] = position_ids;
+    entry["cache_seq_indices"] = cache_seq_indices;
+    entry["logits_shape"] = std::vector<int64_t>{1, top.n_rows, top.k};
+    entry["logits_dtype"] = "float32";
+    entry["backend_sampled"] = true;
+    entry["top_k_ids"] = top.ids;
+    entry["top_k_logprobs"] = top.logprobs;
+    entry["argmax_token_ids"] = argmax_ids;
+    entry["input_string"] = detokenize(input_ids);
+    entry["argmax_string"] = detokenize(argmax_tokens);
+
+    std::lock_guard<std::mutex> lock(g_forward_log_mutex);
     *forward_log_ << entry.dump(-1, ' ', false,
                                 nlohmann::json::error_handler_t::replace)
                   << "\n";
@@ -394,6 +480,77 @@ std::vector<float> LlamaCppEngine::forward_batch(
     std::vector<float> logits = read_logits(n);
     log_forward(input_ids, position_ids, slot_indices, logits);
     return logits;
+}
+
+LlamaCppEngine::TopKRows LlamaCppEngine::forward_batch_topk(
+    const std::vector<llama_token>& input_ids,
+    const std::vector<llama_pos>& position_ids,
+    const std::vector<int32_t>& seq_ids,
+    const std::vector<int32_t>& slot_indices) {
+    require_mode(/*tree=*/true, "forward_batch_topk");
+    if (draft_top_k_ <= 0) {
+        throw std::logic_error(
+            "forward_batch_topk requires Config::draft_top_k > 0; without it "
+            "no backend sampler is attached and llama.cpp returns raw logits.");
+    }
+
+    const int32_t n = static_cast<int32_t>(input_ids.size());
+    if (n == 0) {
+        throw std::invalid_argument("forward_batch_topk: empty batch");
+    }
+    if (position_ids.size() != input_ids.size() || seq_ids.size() != input_ids.size() ||
+        slot_indices.size() != input_ids.size()) {
+        throw std::invalid_argument("forward_batch_topk: inconsistent input sizes");
+    }
+    if (n > n_batch_) {
+        throw std::invalid_argument(
+            "forward_batch_topk: " + std::to_string(n) + " rows exceeds n_batch=" +
+            std::to_string(n_batch_));
+    }
+
+    for (int32_t i = 0; i < n; ++i) {
+        if (seq_ids[i] < 0 || seq_ids[i] >= max_seqs_) {
+            throw std::invalid_argument(
+                "forward_batch_topk: seq_id " + std::to_string(seq_ids[i]) +
+                " out of [0, max_seqs=" + std::to_string(max_seqs_) + ")");
+        }
+        batch_set(i, input_ids[i], position_ids[i], seq_ids[i], /*want_logits=*/true);
+    }
+    decode(n);
+
+    TopKRows out;
+    out.k = draft_top_k_;
+    out.n_rows = n;
+    out.ids.resize(static_cast<size_t>(n) * draft_top_k_);
+    out.logprobs.resize(static_cast<size_t>(n) * draft_top_k_);
+
+    for (int32_t i = 0; i < n; ++i) {
+        const llama_token* candidates = llama_get_sampled_candidates_ith(ctx_, i);
+        const float* probs = llama_get_sampled_probs_ith(ctx_, i);
+        if (candidates == nullptr || probs == nullptr) {
+            throw std::runtime_error(
+                "forward_batch_topk: the backend sampler produced no output for row " +
+                std::to_string(i) + ". The backend most likely does not support "
+                "soft_max or top_k at this width.");
+        }
+        const uint32_t n_cand = llama_get_sampled_candidates_count_ith(ctx_, i);
+        if (static_cast<int32_t>(n_cand) < draft_top_k_) {
+            throw std::runtime_error(
+                "forward_batch_topk: sampler returned " + std::to_string(n_cand) +
+                " candidates, expected " + std::to_string(draft_top_k_));
+        }
+        for (int32_t j = 0; j < draft_top_k_; ++j) {
+            const size_t f = static_cast<size_t>(i) * draft_top_k_ + j;
+            out.ids[f] = candidates[j];
+            // The sampler normalizes over the whole vocabulary before
+            // selecting, so this log is the full-vocab log-probability --
+            // identical to logit - log_z, and comparable across rows.
+            out.logprobs[f] = std::log(probs[j]);
+        }
+    }
+
+    log_forward_topk(input_ids, position_ids, slot_indices, out);
+    return out;
 }
 
 void LlamaCppEngine::seq_cp(int32_t src_seq_id, int32_t dst_seq_id) {
