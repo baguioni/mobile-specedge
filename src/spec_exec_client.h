@@ -60,9 +60,23 @@ public:
         std::string prompt_text,
         Config config);
 
+    // What Generate() decided, for callers comparing two runs rather than
+    // timing one. Kept separate from the return value because the two want
+    // different things: the caller printing a completion wants the sequence
+    // trimmed at the stop token, while a caller diffing against another
+    // implementation needs the untrimmed sequence plus where the stop
+    // actually landed -- trimming first hides whether two runs stopped at
+    // the same place or merely reported the same way.
+    struct GenerateTrace {
+        std::vector<llama_token> tokens;  // untrimmed: prompt + accepted + bonus
+        bool stopped_on_eog = false;      // false => the max_new_tokens budget
+        int32_t eog_index = -1;           // index into tokens, -1 if none
+    };
+
     // Generates a sequence up to max_new_tokens (or an end-of-generation
     // token, whichever comes first) and returns it, prompt included.
-    std::vector<llama_token> Generate(int32_t req_idx);
+    // trace, when non-null, receives the pre-trim record described above.
+    std::vector<llama_token> Generate(int32_t req_idx, GenerateTrace* trace = nullptr);
 
 private:
     // Per-round target-phase timings (milliseconds) and counters, mirroring

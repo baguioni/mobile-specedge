@@ -27,7 +27,9 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -201,6 +203,107 @@ std::string detokenize(const llama_vocab* vocab, const std::vector<llama_token>&
     }
 }
 
+// Per-request generation trace, the C++ half of specedge/src/gen_trace.py.
+//
+// Aggregate metrics cannot answer "are these two systems decoding the same
+// text?" -- two runs can agree on mean accept rate and throughput while
+// starting from different prompts and producing different tokens. This
+// records, per request, the exact prompt that was tokenized, the tokens
+// generated from it, and why generation stopped.
+//
+//   log/trace.jsonl  one record per request, streamed as each finishes, so
+//                    an interrupted run still leaves a usable trace.
+//   log/trace.txt    the same records sorted by req_idx, written at Close().
+//                    The two runs visit requests in different orders
+//                    (std::mt19937 here, CPython's random.shuffle there),
+//                    so sorting is what lets them line up. Diff directly:
+//
+//                        diff serverA/trace.txt log/trace.txt
+//
+// The field list, the 13-column key gutter and the ", " list separator are
+// a contract with gen_trace.py: change one side and every record diffs on
+// formatting alone. nlohmann's dump() escapes strings the way Python's
+// json.dumps(ensure_ascii=False) does, which is why both sides route every
+// value through it -- a newline inside a prompt must not break the
+// one-field-per-line alignment that makes the diff readable.
+class TraceWriter {
+public:
+    explicit TraceWriter(const std::string& log_dir) {
+        std::filesystem::create_directories(log_dir);
+        txt_path_ = log_dir + "/trace.txt";
+        jsonl_.open(log_dir + "/trace.jsonl", std::ios::out | std::ios::trunc);
+        if (!jsonl_.is_open()) {
+            throw std::runtime_error("could not open " + log_dir + "/trace.jsonl");
+        }
+    }
+
+    ~TraceWriter() { Close(); }
+
+    void Add(
+        int32_t req_idx,
+        const std::string& prompt_text,
+        const std::string& output_text,
+        const std::vector<llama_token>& prompt_tokens,
+        const std::vector<llama_token>& output_tokens,
+        const std::string& stop_reason) {
+        nlohmann::ordered_json record;
+        record["req_idx"] = req_idx;
+        record["stop_reason"] = stop_reason;
+        record["prompt_len"] = prompt_tokens.size();
+        record["n_generated"] = output_tokens.size();
+        record["prompt_text"] = prompt_text;
+        record["output_text"] = output_text;
+        record["prompt_tokens"] = prompt_tokens;
+        record["output_tokens"] = output_tokens;
+
+        records_[req_idx] = record;
+        jsonl_ << record.dump() << "\n";
+        jsonl_.flush();
+    }
+
+    void Close() {
+        if (!jsonl_.is_open()) {
+            return;
+        }
+        jsonl_.close();
+
+        std::ofstream txt(txt_path_, std::ios::out | std::ios::trunc);
+        for (const auto& [req_idx, record] : records_) {  // std::map: sorted
+            txt << "==== req_idx=" << req_idx << " ====\n";
+            for (const char* field : kFields) {
+                txt << Pad(field) << " " << Render(record[field]) << "\n";
+            }
+        }
+    }
+
+private:
+    // Fixed order, shared with gen_trace.py's _FIELDS.
+    static constexpr const char* kFields[] = {
+        "stop_reason", "prompt_len",    "n_generated",   "prompt_text",
+        "output_text", "prompt_tokens", "output_tokens",
+    };
+
+    static std::string Pad(const std::string& key) {
+        return key.size() >= 13 ? key : key + std::string(13 - key.size(), ' ');
+    }
+
+    // json.dumps() puts ", " between list elements; dump() puts ",".
+    static std::string Render(const nlohmann::ordered_json& value) {
+        if (!value.is_array()) {
+            return value.dump();
+        }
+        std::string out = "[";
+        for (size_t i = 0; i < value.size(); ++i) {
+            out += (i ? ", " : "") + value[i].dump();
+        }
+        return out + "]";
+    }
+
+    std::string txt_path_;
+    std::ofstream jsonl_;
+    std::map<int32_t, nlohmann::ordered_json> records_;
+};
+
 // Wraps a single user turn with the GGUF's built-in chat template, the way
 // util.load_dataset() calls tokenizer.apply_chat_template() for specbench.
 std::string apply_chat_template(const llama_model* model, const std::string& user_msg) {
@@ -345,6 +448,8 @@ int main(int argc, char** argv) {
         const std::vector<int32_t> req_indices =
             build_request_indices(static_cast<int32_t>(dataset.size()), cfg);
 
+        TraceWriter trace("log");
+
         std::fprintf(stderr,
             "Loaded dataset '%s' (%zu prompts); running %zu requests against %s\n",
             cfg.dataset.c_str(), dataset.size(), req_indices.size(), cfg.host.c_str());
@@ -361,6 +466,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr,
                     "  Skipping req_idx=%d: %zu prompt + %d new tokens exceeds max_len=%d\n",
                     req_idx, prompt_tokens.size(), cfg.max_new_tokens, cfg.max_len);
+                trace.Add(
+                    req_idx, prompt, "", prompt_tokens, {}, "skipped_max_len");
                 continue;
             }
 
@@ -374,7 +481,8 @@ int main(int argc, char** argv) {
 
             specedge::SpecExecClient client(
                 engine, validator, prompt_tokens, prompt, client_config);
-            const std::vector<llama_token> generated = client.Generate(req_idx);
+            specedge::SpecExecClient::GenerateTrace gen_trace;
+            const std::vector<llama_token> generated = client.Generate(req_idx, &gen_trace);
 
             std::vector<llama_token> completion = generated;
             if (generated.size() >= prompt_tokens.size()) {
@@ -383,6 +491,17 @@ int main(int argc, char** argv) {
                     generated.end());
             }
 
+            // Traced from the untrimmed sequence, so a length difference
+            // against the Python run reads as a real difference in what was
+            // decoded rather than a difference in what each side reports.
+            const std::vector<llama_token> traced_output(
+                gen_trace.tokens.begin() + static_cast<std::ptrdiff_t>(prompt_tokens.size()),
+                gen_trace.tokens.end());
+            trace.Add(
+                req_idx, prompt, detokenize(engine.vocab(), traced_output),
+                prompt_tokens, traced_output,
+                gen_trace.stopped_on_eog ? "eos" : "max_new_tokens");
+
             std::printf("=== req_idx=%d (%zu/%zu) ===\n", req_idx, k + 1, req_indices.size());
             std::printf("Prompt: %s\n", prompt.c_str());
             std::printf("Completion: %s\n\n",
@@ -390,6 +509,7 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         }
 
+        trace.Close();
         return 0;
     } catch (const std::exception& e) {
         // Model load, YAML parse, the gRPC channel (target unreachable), or

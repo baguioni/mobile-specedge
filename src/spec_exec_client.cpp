@@ -149,7 +149,7 @@ SpecExecClient::SpecExecClient(
     engine_.reset();
 }
 
-std::vector<llama_token> SpecExecClient::Generate(int32_t req_idx) {
+std::vector<llama_token> SpecExecClient::Generate(int32_t req_idx, GenerateTrace* trace) {
     std::fprintf(stderr, "[SpecExecClient] Generating sequence req_idx=%d\n", req_idx);
 
     int32_t step_idx = 0;
@@ -189,17 +189,31 @@ std::vector<llama_token> SpecExecClient::Generate(int32_t req_idx) {
 
     std::vector<llama_token> generated(
         tree_.tokens().begin(), tree_.tokens().begin() + tree_.prefix_len());
+
+    // Where the stop landed. The scan starts at num_original_tokens, not 0:
+    // a ChatML prompt ends its user turn with <|im_end|>, which is the EOS
+    // token and therefore an EOG token, so a scan from 0 finds the prompt's
+    // own terminator every time and never reaches the completion.
+    int32_t eog_index = -1;
+    for (size_t i = static_cast<size_t>(num_original_tokens); i < generated.size(); ++i) {
+        if (llama_vocab_is_eog(vocab, generated[i])) {
+            eog_index = static_cast<int32_t>(i);
+            break;
+        }
+    }
+
+    if (trace != nullptr) {
+        trace->tokens = generated;
+        trace->stopped_on_eog = eog_flag;
+        trace->eog_index = eog_index;
+    }
+
     // Trim the reported sequence at the first end-of-generation token, same
     // as specexec.py's generate() slicing fresh_tokens at eos_idx --
     // tree_/engine_ state itself is left untouched since no further round
     // will read past it.
-    if (eog_flag) {
-        for (size_t i = 0; i < generated.size(); ++i) {
-            if (llama_vocab_is_eog(vocab, generated[i])) {
-                generated.resize(i + 1);
-                break;
-            }
-        }
+    if (eog_flag && eog_index >= 0) {
+        generated.resize(static_cast<size_t>(eog_index) + 1);
     }
 
     std::fprintf(
