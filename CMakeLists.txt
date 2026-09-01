@@ -18,7 +18,13 @@ GIT_SHALLOW    TRUE
 )
 
 # Build only the llama/ggml libraries this project links against.
-set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+# LLAMA_BUILD_COMMON is ON (unlike TESTS/EXAMPLES/SERVER below): the batch
+# client needs its `llama-common` target for common_chat_templates_apply()
+# -- the Jinja engine that runs a model's own chat_template, as opposed to
+# llama_chat_apply_template()'s fixed C reimplementation of a few known
+# templates -- so that `client.reasoning` maps to enable_thinking correctly
+# for any model (see src/script/client.cpp's apply_chat_template()).
+set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
@@ -81,4 +87,4 @@ target_link_libraries(graph_engine_lib PUBLIC llama nlohmann_json::nlohmann_json
 # runs each prompt through tree-based (SpecExec) speculative decoding. Port
 # of specedge/src/script/client.py.
 add_executable(client src/script/client.cpp)
-target_link_libraries(client PRIVATE graph_engine_lib yaml-cpp::yaml-cpp)
+target_link_libraries(client PRIVATE graph_engine_lib yaml-cpp::yaml-cpp llama-common)

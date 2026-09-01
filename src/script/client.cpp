@@ -20,9 +20,6 @@
 //  - Shuffle uses std::mt19937 seeded with client_idx, so the visiting
 //    order is deterministic per client but not bit-identical to CPython's
 //    random.shuffle().
-//  - reasoning: llama_chat_apply_template() has no thinking toggle, so the
-//    flag is accepted but only gates whether the chat template is applied
-//    at all (parity with client.py applying a template for specbench).
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -39,6 +36,7 @@
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include "chat.h"
 #include "llama.h"
 
 #include "graph_engine.h"
@@ -306,24 +304,29 @@ private:
 
 // Wraps a single user turn with the GGUF's built-in chat template, the way
 // util.load_dataset() calls tokenizer.apply_chat_template() for specbench.
-std::string apply_chat_template(const llama_model* model, const std::string& user_msg) {
-    const char* tmpl = llama_model_chat_template(model, /*name=*/nullptr);
-    if (tmpl == nullptr) {
-        return user_msg;  // model ships no template; use the raw turn.
-    }
-    llama_chat_message msg{"user", user_msg.c_str()};
-    std::vector<char> buf(user_msg.size() + 2048);
-    int32_t n = llama_chat_apply_template(
-        tmpl, &msg, 1, /*add_ass=*/true, buf.data(), static_cast<int32_t>(buf.size()));
-    if (n > static_cast<int32_t>(buf.size())) {
-        buf.resize(static_cast<size_t>(n));
-        n = llama_chat_apply_template(
-            tmpl, &msg, 1, true, buf.data(), static_cast<int32_t>(buf.size()));
-    }
-    if (n < 0) {
-        throw std::runtime_error("llama_chat_apply_template failed for the draft model");
-    }
-    return std::string(buf.data(), static_cast<size_t>(n));
+//
+// Goes through common_chat_templates_apply() (llama.cpp's Jinja engine)
+// rather than the plain C llama_chat_apply_template() API: the latter is a
+// hand-rolled reimplementation of a handful of known templates and has no
+// concept of `enable_thinking`, so a model's own reasoning toggle was
+// silently dropped no matter what `reasoning` was set to. Running the
+// model's actual chat_template through Jinja means `enable_thinking` does
+// whatever that template defines it to do -- the same mechanism
+// tokenizer.apply_chat_template(enable_thinking=...) uses on the Python
+// side -- for any model, not just ones special-cased here.
+std::string apply_chat_template(
+    const common_chat_templates* tmpls, const std::string& user_msg, bool reasoning) {
+    common_chat_msg msg;
+    msg.role = "user";
+    msg.content = user_msg;
+
+    common_chat_templates_inputs inputs;
+    inputs.messages.push_back(msg);
+    inputs.add_generation_prompt = true;
+    inputs.use_jinja = true;
+    inputs.enable_thinking = reasoning;
+
+    return common_chat_templates_apply(tmpls, inputs).prompt;
 }
 
 std::string to_lower(std::string s) {
@@ -342,12 +345,18 @@ std::vector<std::string> load_dataset(
     const std::string data_dir = kDataDir;
     std::vector<std::string> prompts;
 
-    // client.py applies a chat template for specbench regardless of the
-    // reasoning flag (that flag only feeds enable_thinking); accepted and
-    // ignored here since llama_chat_apply_template() has no equivalent.
-    (void)reasoning;
-
     if (stem == "specbench_prompts") {
+        // Parses the model's own chat_template once (Jinja), then reused
+        // for every prompt below -- see apply_chat_template().
+        common_chat_templates_ptr tmpls = common_chat_templates_init(model, "");
+        if (reasoning && !common_chat_templates_support_enable_thinking(tmpls.get())) {
+            std::fprintf(
+                stderr,
+                "[client] warning: the draft model's chat template has no "
+                "enable_thinking toggle; `reasoning: true` has no effect for "
+                "this model\n");
+        }
+
         const std::string path = data_dir + "/" + stem + ".jsonl";
         std::ifstream f(path);
         if (!f) {
@@ -360,7 +369,7 @@ std::vector<std::string> load_dataset(
             }
             const nlohmann::json row = nlohmann::json::parse(line);
             const std::string turn0 = row.at("turns").at(0).get<std::string>();
-            prompts.push_back(apply_chat_template(model, turn0));
+            prompts.push_back(apply_chat_template(tmpls.get(), turn0, reasoning));
         }
     } else {
         const std::string path = data_dir + "/" + stem + ".json";
