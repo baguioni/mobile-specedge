@@ -80,9 +80,6 @@ target_link_libraries(graph_engine_lib PUBLIC llama nlohmann_json::nlohmann_json
 add_executable(graph_engine src/graph_engine_main.cpp)
 target_link_libraries(graph_engine PRIVATE graph_engine_lib)
 
-add_executable(parity_test src/parity_test.cpp)
-target_link_libraries(parity_test PRIVATE graph_engine_lib)
-
 add_executable(tree_client src/client_main.cpp)
 target_link_libraries(tree_client PRIVATE graph_engine_lib)
 

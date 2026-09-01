@@ -29,7 +29,6 @@ beyond the local smoke test.
 | `src/graph_engine_main.cpp` | → `graph_engine` binary. Local-only smoke test. |
 | `src/client_main.cpp` | → `tree_client` binary. One `--prompt` against a live target. |
 | `src/script/client.cpp` | → `client` binary. Config-driven batch run over a dataset. |
-| `src/parity_test.cpp` | → `parity_test` binary. Fixed `Validate` request, for Python/C++ wire parity checks. |
 | `src/config.h` | Env-var config reader kept for parity with the Python launcher. **Not used by any current binary.** |
 | `src/metric/mobile.py` | Post-run latency/throughput analysis of the JSONL result logs. |
 | `config/client.example.yaml` | Example config for the `client` binary. |
@@ -68,8 +67,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-Binaries are written to `build/`: `graph_engine`, `tree_client`, `client`,
-`parity_test`.
+Binaries are written to `build/`: `graph_engine`, `tree_client`, `client`.
 
 ### GPU / accelerator offload
 
@@ -279,16 +277,6 @@ commented list. Key fields:
 | `max_request_num` | `-1` = whole dataset, else absolute upper index |
 | `req_offset`, `sample_req_cnt` | start index, and take every Nth prompt |
 | `n_gpu_layers`, `main_gpu`, `n_threads`, `n_threads_batch` | llama.cpp placement / threading |
-
-### 5. `parity_test` — wire-format check
-
-No arguments; sends a fixed `Validate` request to `localhost:50555` with
-`fp32` mask dtype and prints the response. Used to diff the C++ `GrpcClient`
-against the Python client, both against `mock_server.py`.
-
-```sh
-./build/parity_test
-```
 
 ---
 
