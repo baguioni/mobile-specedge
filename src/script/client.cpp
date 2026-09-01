@@ -1,7 +1,6 @@
 // Config-driven batch client. C++ port of specedge/src/script/client.py.
 //
-// Where client_main.cpp runs a single --prompt one-shot, this reads a YAML
-// config holding every client-side option (draft model, target host,
+// Reads a YAML config holding every client-side option (draft model, target host,
 // max_len, decoding params, dataset selection) and then walks the entire
 // dataset: it builds the request-index list the same way client.py does
 // (offset slice -> stride subsample -> seeded shuffle) and feeds each prompt
@@ -178,9 +177,8 @@ std::vector<llama_token> tokenize(const llama_vocab* vocab, const std::string& t
     return tokens;
 }
 
-// Same fallback rationale as client_main.cpp: a misbehaving/test target can
-// return a token id with no piece data, which llama.cpp raises as an
-// uncaught std::out_of_range.
+// A misbehaving/test target can return a token id with no piece data, which
+// llama.cpp raises as an uncaught std::out_of_range.
 std::string detokenize(const llama_vocab* vocab, const std::vector<llama_token>& tokens) {
     try {
         std::vector<char> buf(tokens.size() * 8 + 16);

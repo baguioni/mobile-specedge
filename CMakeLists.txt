@@ -77,12 +77,6 @@ target_link_directories(graph_engine_lib PUBLIC ${GRPC_LIBRARY_DIRS})
 target_compile_options(graph_engine_lib PUBLIC ${GRPC_CFLAGS_OTHER})
 target_link_libraries(graph_engine_lib PUBLIC llama nlohmann_json::nlohmann_json protobuf::libprotobuf ${GRPC_LIBRARIES})
 
-add_executable(graph_engine src/graph_engine_main.cpp)
-target_link_libraries(graph_engine PRIVATE graph_engine_lib)
-
-add_executable(tree_client src/client_main.cpp)
-target_link_libraries(tree_client PRIVATE graph_engine_lib)
-
 # Config-driven batch client: reads a YAML config, walks a whole dataset,
 # runs each prompt through tree-based (SpecExec) speculative decoding. Port
 # of specedge/src/script/client.py.

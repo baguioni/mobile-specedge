@@ -11,8 +11,8 @@ This is a C++ port of the Python `specedge` project's client, intended to run on
 a phone / edge device against a server-class target.
 
 The **target server is not in this repository** — you need a running
-`SpecEdgeService` from the Python `specedge` project (or a mock) to do anything
-beyond the local smoke test.
+`SpecEdgeService` from the Python `specedge` project (or a mock) to run
+anything here.
 
 ---
 
@@ -26,9 +26,7 @@ beyond the local smoke test.
 | `src/grpc_client.{h,cpp}` | `GrpcClient` — synchronous client for the `Validate` RPC. |
 | `src/tree.{h,cpp}` | `Tree` — the client-side draft tree (slots, positions, parents, attention mask). |
 | `src/spec_exec_client.{h,cpp}` | `SpecExecClient` — the draft + verify round loop (port of `specexec.py`). |
-| `src/graph_engine_main.cpp` | → `graph_engine` binary. Local-only smoke test. |
-| `src/client_main.cpp` | → `tree_client` binary. One `--prompt` against a live target. |
-| `src/script/client.cpp` | → `client` binary. Config-driven batch run over a dataset. |
+| `src/script/client.cpp` | → `client` binary, the only executable. Config-driven batch run over a dataset. |
 | `src/config.h` | Env-var config reader kept for parity with the Python launcher. **Not used by any current binary.** |
 | `src/metric/mobile.py` | Post-run latency/throughput analysis of the JSONL result logs. |
 | `config/client.example.yaml` | Example config for the `client` binary. |
@@ -67,14 +65,13 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-Binaries are written to `build/`: `graph_engine`, `tree_client`, `client`.
+The build produces a single binary: `build/client`.
 
 ### GPU / accelerator offload
 
 llama.cpp backend options pass straight through at configure time, e.g.
-`-DGGML_METAL=ON` (Apple), `-DGGML_CUDA=ON`, `-DGGML_VULKAN=ON`. At run time use
-`--n-gpu-layers` (CLI) or `n_gpu_layers` (YAML): `-1` offloads all layers, `0` is
-CPU-only.
+`-DGGML_METAL=ON` (Apple), `-DGGML_CUDA=ON`, `-DGGML_VULKAN=ON`. At run time set
+`n_gpu_layers` in the YAML config: `-1` offloads all layers, `0` is CPU-only.
 
 ### CUDA build
 
@@ -114,26 +111,8 @@ cmake --build build -j
 
 **Run on the GPU**
 
-The binaries are unchanged — you just have to ask for offload, which is
-CPU-only by default:
-
-```sh
-# tree_client: offload every layer to GPU 0
-./build/tree_client \
-  --host 127.0.0.1:8000 --dtype fp16 \
-  --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf \
-  --prompt "Explain speculative decoding in one paragraph." \
-  --max-new-tokens 64 \
-  --n-gpu-layers -1
-
-# graph_engine smoke test on the GPU
-./build/graph_engine \
-  --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf \
-  --prompt "The capital of France is" --n-generate 16 \
-  --n-gpu-layers -1
-```
-
-For the `client` batch binary, set it in the YAML:
+The binary is unchanged — you just have to ask for offload in the YAML, which
+is CPU-only by default:
 
 ```yaml
 client:
@@ -142,18 +121,15 @@ client:
   single_gpu: true   # whole model on main_gpu only; false splits layers across all visible GPUs
 ```
 
-`--n-gpu-layers -1` (or `n_gpu_layers: -1`) offloads all layers; a positive
-value offloads that many. `graph_engine` and `tree_client` expose only
-`--n-gpu-layers` and always use device 0 — select another card with
-`CUDA_VISIBLE_DEVICES=1 ./build/tree_client …`. The `client` binary also
-takes `main_gpu:` in the YAML to pick the CUDA device directly.
+`n_gpu_layers: -1` offloads all layers; a positive value offloads that many.
+`main_gpu` picks the CUDA device directly, so `CUDA_VISIBLE_DEVICES` is not
+needed.
 
-By default every binary now loads with llama.cpp's `LLAMA_SPLIT_MODE_NONE`,
-so the draft model stays on a single GPU (`main_gpu`). Set `single_gpu: false`
-in the `client` YAML to restore llama.cpp's default layer-split across all
-visible CUDA devices. On load, llama.cpp logs lines like
-`load_tensors: offloaded 29/29 layers to GPU` — check those to confirm the
-draft model is actually on the GPU.
+The draft model loads with llama.cpp's `LLAMA_SPLIT_MODE_NONE`, so it stays on
+a single GPU (`main_gpu`). Set `single_gpu: false` to restore llama.cpp's
+default layer-split across all visible CUDA devices. On load, llama.cpp logs
+lines like `load_tensors: offloaded 29/29 layers to GPU` — check those to
+confirm the draft model is actually on the GPU.
 
 ### Regenerating the gRPC stubs (only if needed)
 
@@ -172,15 +148,15 @@ Then fix the includes if your protoc layout differs from the committed
 
 ## Models
 
-All local binaries need a GGUF draft model. The default path everywhere is:
+The `client` binary needs a GGUF draft model. The default path is:
 
 ```
 models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf
 ```
 
-Download it (e.g. from Hugging Face) and place it there, or pass `--model` /
-set `draft_model:` in the YAML. Paths are resolved relative to the current
-working directory, so run the binaries **from the project root**.
+Download it (e.g. from Hugging Face) and place it there, or set `draft_model:`
+in the YAML. Paths are resolved relative to the current working directory, so
+run the binary **from the project root**.
 
 The large model runs on the target server and is configured there, not here.
 
@@ -188,65 +164,16 @@ The large model runs on the target server and is configured there, not here.
 
 ## Running
 
-### 1. `graph_engine` — local smoke test (no server)
-
-Prefills a prompt and greedily decodes locally. Proves the build links against
-real llama.cpp and that prefill/forward/gather round-trip.
-
-```sh
-./build/graph_engine \
-  --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf \
-  --prompt "The capital of France is" \
-  --n-generate 16
-```
-
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `--model <path>` | `models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf` | GGUF model path |
-| `--prompt <text>` | `"The capital of France is"` | prompt to complete |
-| `--max-len <n>` | `256` | context / `max_len` |
-| `--n-generate <n>` | `8` | tokens to greedily decode |
-| `--n-gpu-layers <n>` | `0` | layers to offload (`-1` = all) |
-| `--n-threads <n>` | llama.cpp default | decode threads |
-| `--n-threads-batch <n>` | = `--n-threads` | batch threads |
-
-### 2. Start a target server
+### 1. Start a target server
 
 Bring up a `SpecEdgeService` (from the Python `specedge` project, or a mock)
 listening on some `host:port`. Note its model dtype (`SPECEDGE_DTYPE` /
 `base.dtype`) — the `Validate` wire format carries no dtype tag, so the client's
-`--dtype` / `dtype:` **must match it exactly** (`fp16` default, or `fp32` /
+`dtype:` **must match it exactly** (`fp16` default, or `fp32` /
 `bf16`). Also keep the client's `max_budget` equal to the server's
 `SPECEDGE_MAX_BUDGET` (the server sizes its cache buffers from it).
 
-### 3. `tree_client` — one prompt against the target
-
-```sh
-./build/tree_client \
-  --host 127.0.0.1:8000 \
-  --dtype fp16 \
-  --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf \
-  --prompt "Explain speculative decoding in one paragraph." \
-  --max-new-tokens 64
-```
-
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `--host <host:port>` | `localhost:50555` | `SpecEdgeService` address |
-| `--dtype <fp32\|fp16\|bf16>` | `fp16` | `attention_mask` wire dtype — **match the server** |
-| `--model <path>` | `models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf` | GGUF draft model |
-| `--prompt <text>` | `"The capital of France is"` | prompt to complete |
-| `--max-len <n>` | `256` | context budget (prompt + generation) |
-| `--max-n-beams <n>` | `4` | candidates expanded per draft step |
-| `--max-beam-len <n>` | `8` | draft steps (tree depth) per round |
-| `--max-branch-width <n>` | `2` | children sampled per candidate |
-| `--max-budget <n>` | `16` | draft-node budget per round — **match the server** |
-| `--max-seqs <n>` | `0` (auto) | llama.cpp sequences; `0` derives an upper bound, capped at 256 |
-| `--max-new-tokens <n>` | `32` | tokens to generate |
-| `--n-gpu-layers <n>` | `0` | layers to offload (`-1` = all) |
-| `--n-threads <n>` / `--n-threads-batch <n>` | llama.cpp default | thread counts |
-
-### 4. `client` — batch run over a dataset
+### 2. `client` — batch run over a dataset
 
 Reads a YAML config, loads a dataset from `./data`, builds the request order
 (`req_offset` slice → `sample_req_cnt` stride → shuffle seeded by `client_idx`),
@@ -283,9 +210,8 @@ commented list. Key fields:
 ## Output logs
 
 - **`log/client_<client_idx>.jsonl`** — one JSON record per draft+verify round
-  (timings, accepted-token counts). Written by `SpecExecClient`, so both
-  `tree_client` and `client` produce it. Truncated on first open per process,
-  appended thereafter.
+  (timings, accepted-token counts). Written by `SpecExecClient`. Truncated on
+  first open per process, appended thereafter.
 - **`graph-engine.log`** — per-forward debug log from `LlamaCppEngine`. Goes to
   the current directory, or to `$SPECEDGE_RESULT_PATH/$SPECEDGE_EXP_NAME/` when
   both env vars are set.
@@ -312,9 +238,8 @@ python src/metric/mobile.py --data run/
 
 ## Typical end-to-end flow
 
-1. Build the binaries (`cmake … && cmake --build build -j`).
-2. `./build/graph_engine …` to confirm the draft model loads and decodes.
-3. Start the `SpecEdgeService` target; note its dtype and `max_budget`.
-4. `./build/client --config config/client.yaml` (matching `dtype` / `max_budget`).
-5. Collect `log/client_*.jsonl` + the server's `server.jsonl`.
-6. `python src/metric/mobile.py --data run/` for the summary.
+1. Build the binary (`cmake … && cmake --build build -j`).
+2. Start the `SpecEdgeService` target; note its dtype and `max_budget`.
+3. `./build/client --config config/client.yaml` (matching `dtype` / `max_budget`).
+4. Collect `log/client_*.jsonl` + the server's `server.jsonl`.
+5. `python src/metric/mobile.py --data run/` for the summary.
