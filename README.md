@@ -54,6 +54,8 @@ beyond the local smoke test.
   - macOS: `brew install grpc protobuf`
   - Debian/Ubuntu: `apt install libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev`
 - A **GGUF draft model** (see [Models](#models)).
+- *For a CUDA build:* the **NVIDIA CUDA Toolkit** (`nvcc`) and a matching
+  driver — see [CUDA build](#cuda-build).
 
 > The checked-in stubs in `src/specedge_grpc/` must be ABI-compatible with the
 > gRPC/Protobuf you link against. If `find_package` picks up a very different
@@ -75,6 +77,79 @@ llama.cpp backend options pass straight through at configure time, e.g.
 `-DGGML_METAL=ON` (Apple), `-DGGML_CUDA=ON`, `-DGGML_VULKAN=ON`. At run time use
 `--n-gpu-layers` (CLI) or `n_gpu_layers` (YAML): `-1` offloads all layers, `0` is
 CPU-only.
+
+### CUDA build
+
+Builds the bundled llama.cpp (`b10615`) with its CUDA backend so the draft
+model runs on an NVIDIA GPU.
+
+**Prerequisites**
+
+- NVIDIA GPU with a driver new enough for your CUDA Toolkit.
+- **CUDA Toolkit** (`nvcc`) — 12.x recommended. Check with `nvcc --version`;
+  `nvidia-smi` should list the GPU.
+- CMake must be able to find CUDA. If `nvcc` is not on `PATH`, either add it
+  (`export PATH=/usr/local/cuda/bin:$PATH`) or pass
+  `-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc`.
+- gRPC / Protobuf as for any build (`find_package` must still resolve them).
+
+**Configure and build**
+
+```sh
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=native
+cmake --build build -j
+```
+
+- `-DGGML_CUDA=ON` is forwarded to the fetched llama.cpp; no other flag is
+  needed to link the CUDA backend into the `graph_engine_lib` target.
+- `-DCMAKE_CUDA_ARCHITECTURES=native` targets the build host's GPU. For a
+  portable binary give explicit SMs instead, e.g. `"80;86;89"` (A100 / 30xx /
+  40xx).
+- Optional llama.cpp CUDA knobs, all passed the same way:
+  `-DGGML_CUDA_FA_ALL_QUANTS=ON` (flash-attention for all quant types),
+  `-DGGML_CUDA_FORCE_MMQ=ON`, `-DGGML_CUDA_PEER_MAX_BATCH_SIZE=<n>`.
+- First configure still needs network access (FetchContent), and the CUDA
+  backend adds a few minutes to the build.
+
+**Run on the GPU**
+
+The binaries are unchanged — you just have to ask for offload, which is
+CPU-only by default:
+
+```sh
+# tree_client: offload every layer to GPU 0
+./build/tree_client \
+  --host 127.0.0.1:8000 --dtype fp16 \
+  --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf \
+  --prompt "Explain speculative decoding in one paragraph." \
+  --max-new-tokens 64 \
+  --n-gpu-layers -1
+
+# graph_engine smoke test on the GPU
+./build/graph_engine \
+  --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf \
+  --prompt "The capital of France is" --n-generate 16 \
+  --n-gpu-layers -1
+```
+
+For the `client` batch binary, set it in the YAML:
+
+```yaml
+client:
+  n_gpu_layers: -1   # -1 = all layers, 0 = CPU only
+  main_gpu: 0        # which CUDA device to use
+```
+
+`--n-gpu-layers -1` (or `n_gpu_layers: -1`) offloads all layers; a positive
+value offloads that many. `graph_engine` and `tree_client` expose only
+`--n-gpu-layers` and always use device 0 — select another card with
+`CUDA_VISIBLE_DEVICES=1 ./build/tree_client …`. The `client` binary also
+takes `main_gpu:` in the YAML to pick the CUDA device directly. On load,
+llama.cpp logs lines like `load_tensors: offloaded 29/29 layers to GPU` —
+check those to confirm the draft model is actually on the GPU.
 
 ### Regenerating the gRPC stubs (only if needed)
 
