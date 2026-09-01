@@ -4,7 +4,7 @@ project(specedge_graph_engine LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release)
+set(CMAKE_BUILD_TYPE Release)
 endif()
 
 include(FetchContent)
@@ -12,9 +12,9 @@ include(FetchContent)
 # Pin to a released tag so builds are reproducible; bump deliberately.
 FetchContent_Declare(
   llama_cpp
-  GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-  GIT_TAG        b10615
-  GIT_SHALLOW    TRUE
+GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
+GIT_TAG        b10615
+GIT_SHALLOW    TRUE
 )
 
 # Build only the llama/ggml libraries this project links against.
@@ -26,9 +26,9 @@ set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
   nlohmann_json
-  GIT_REPOSITORY https://github.com/nlohmann/json.git
-  GIT_TAG        v3.11.3
-  GIT_SHALLOW    TRUE
+GIT_REPOSITORY https://github.com/nlohmann/json.git
+GIT_TAG        v3.11.3
+GIT_SHALLOW    TRUE
 )
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 
@@ -40,9 +40,9 @@ set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 FetchContent_Declare(
   yaml_cpp
-  GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
-  GIT_TAG        0.8.0
-  GIT_SHALLOW    TRUE
+GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
+GIT_TAG        0.8.0
+GIT_SHALLOW    TRUE
 )
 set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
@@ -54,19 +54,27 @@ FetchContent_MakeAvailable(llama_cpp nlohmann_json yaml_cpp)
 # gRPC/Protobuf are consumed from the system install (see src/specedge_grpc/,
 # pre-generated from specedge.proto with a matching protoc/grpc_cpp_plugin
 # version) rather than FetchContent'd, since gRPC is a heavy from-source build.
-find_package(Protobuf CONFIG REQUIRED)
-find_package(gRPC CONFIG REQUIRED)
+#
+# Ubuntu's libgrpc++-dev (1.16.1) does not ship CMake config files
+# (gRPCConfig.cmake), only pkg-config .pc files, so gRPC is located via
+# pkg-config rather than find_package(gRPC CONFIG).
+find_package(Protobuf REQUIRED)
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GRPC REQUIRED grpc++)
 
 add_library(graph_engine_lib
-  src/graph_engine.cpp
-  src/grpc_client.cpp
-  src/tree.cpp
-  src/spec_exec_client.cpp
-  src/specedge_grpc/specedge.pb.cc
-  src/specedge_grpc/specedge.grpc.pb.cc
+src/graph_engine.cpp
+src/grpc_client.cpp
+src/tree.cpp
+src/spec_exec_client.cpp
+src/specedge_grpc/specedge.pb.cc
+src/specedge_grpc/specedge.grpc.pb.cc
 )
-target_include_directories(graph_engine_lib PUBLIC src)
-target_link_libraries(graph_engine_lib PUBLIC llama nlohmann_json::nlohmann_json protobuf::libprotobuf gRPC::grpc++)
+target_include_directories(graph_engine_lib PUBLIC src ${GRPC_INCLUDE_DIRS})
+target_link_directories(graph_engine_lib PUBLIC ${GRPC_LIBRARY_DIRS})
+target_compile_options(graph_engine_lib PUBLIC ${GRPC_CFLAGS_OTHER})
+target_link_libraries(graph_engine_lib PUBLIC llama nlohmann_json::nlohmann_json protobuf::libprotobuf ${GRPC_LIBRARIES})
 
 add_executable(graph_engine src/graph_engine_main.cpp)
 target_link_libraries(graph_engine PRIVATE graph_engine_lib)
