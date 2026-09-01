@@ -372,11 +372,33 @@ void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
             for (int32_t v = 1; v < n_vocab; ++v) {
                 row_max = std::max(row_max, row[v]);
             }
-            double sum_exp = 0.0;
-            for (int32_t v = 0; v < n_vocab; ++v) {
-                sum_exp += std::exp(static_cast<double>(row[v]) - row_max);
+            // Four partial accumulators, float throughout. The double
+            // version's extra precision was discarded by the cast on the
+            // log_z line below, and torch's log_softmax -- the reference
+            // this is a port of -- reduces in fp32 anyway, so this is if
+            // anything the more faithful arithmetic.
+            //
+            // Measured on the vocab-sized rows this actually sees, the
+            // narrower type is the larger half (~1.7x) and splitting the
+            // accumulator adds ~1.3x on top: a single `sum += exp(...)` is
+            // one serial dependency chain, so the core finishes each add
+            // before starting the next exp, and four chains keep several in
+            // flight. Eight chains measured only ~4% beyond four, so this
+            // is the plateau, not an arbitrary unroll. Worth the ugliness
+            // because this loop is ~half the whole decode step -- see
+            // draft.softmax in the result log.
+            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+            int32_t v = 0;
+            for (; v + 3 < n_vocab; v += 4) {
+                acc0 += std::exp(row[v] - row_max);
+                acc1 += std::exp(row[v + 1] - row_max);
+                acc2 += std::exp(row[v + 2] - row_max);
+                acc3 += std::exp(row[v + 3] - row_max);
             }
-            const float log_z = row_max + static_cast<float>(std::log(sum_exp));
+            for (; v < n_vocab; ++v) {
+                acc0 += std::exp(row[v] - row_max);
+            }
+            const float log_z = row_max + std::log((acc0 + acc1) + (acc2 + acc3));
             softmax_acc += MillisSince(softmax_start);
 
             SteadyClock::time_point topk_start = SteadyClock::now();
