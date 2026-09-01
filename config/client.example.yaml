@@ -7,10 +7,10 @@ client:
   host: mango1:8000
   dtype: fp16
   max_len: 2048
-  max_n_beams: 4
-  max_beam_len: 8
-  max_branch_width: 2
-  max_budget: 16
+  max_n_beams: 32
+  max_beam_len: 4
+  max_branch_width: 16
+  max_budget: 64
   max_seqs: null
   max_new_tokens: 64
   client_idx: 0
