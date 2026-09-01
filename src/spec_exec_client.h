@@ -77,16 +77,16 @@ private:
     };
 
     // Per-round draft-phase timings (milliseconds), one entry per tree
-    // level. forward is the engine call; the other three break down the
-    // per-level CPU work _get_next_beams and the fork loop do around it.
-    // All four sum to nearly all of draft.end_to_end -- the remainder is
-    // the joint-budget selection and Tree bookkeeping (tree_.add,
-    // TrimByBudget), which touch O(max_budget) floats rather than the
-    // O(n_beams * n_vocab) the timed spans do.
+    // level. Both spans plus the residual account for nearly all of
+    // draft.end_to_end; the remainder is the joint-budget selection and
+    // Tree bookkeeping (tree_.add, TrimByBudget), all O(max_budget).
+    //
+    // There is no softmax or top-k span because there is no host softmax or
+    // top-k: both are graph nodes inside the engine call, so their cost is
+    // part of forward_ms. Logs written before that change also carry
+    // draft.softmax / draft.topk.
     struct DraftStats {
-        std::vector<double> forward_ms;  // engine_.forward_batch
-        std::vector<double> softmax_ms;  // row_max + sum_exp log-softmax denominator
-        std::vector<double> topk_ms;     // TopKIndices over the full vocab
+        std::vector<double> forward_ms;  // engine_.forward_batch_topk
         std::vector<double> fork_ms;     // seq_cp branch forks + tree_.add
         std::vector<int32_t> n_beams;    // rows expanded at this level
     };

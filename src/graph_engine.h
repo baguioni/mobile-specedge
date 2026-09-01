@@ -24,7 +24,7 @@ namespace specedge {
 //    tag-only copy (no KV data moves), and the tree attention mask is
 //    *derived* by llama.cpp from (seq tags, pos) -- no mask is ever
 //    injected. Branch forks are seq_cp(), levels are decoded in one batch
-//    via forward_batch(), and acceptance is collapse_to_seq(): keep the
+//    via forward_batch_topk(), and acceptance is collapse_to_seq(): keep the
 //    winning branch's cells, retag them onto the canonical seq 0. Cells
 //    never move -- unlike graph.py's gather, which permutes torch cache
 //    rows.
@@ -57,11 +57,11 @@ public:
         // every visible CUDA device. Only meaningful with a GPU build and
         // n_gpu_layers != 0.
         bool single_gpu = true;
-        // Tree mode only. When > 0, a backend top-k sampler (topk_sampler.h)
-        // is attached to every sequence, forward_batch_topk() becomes usable,
-        // and llama.cpp stops copying raw logits to the host. Set it to the
-        // draft's branch width. 0 leaves sampling on the host and only
-        // forward_batch() works.
+        // Required in tree mode, and must equal the draft's branch width.
+        // A backend top-k sampler (topk_sampler.h) is attached to every
+        // sequence, which is what makes forward_batch_topk() work and what
+        // stops llama.cpp copying raw logits to the host. Left at 0 in
+        // linear mode, which has no sampler and returns full logits.
         int32_t draft_top_k = 0;
         std::string role = "unknown";
         // Optional external vocab size (e.g. an HF tokenizer's vocab_size)
@@ -80,7 +80,7 @@ public:
     void close();
 
     // Prefills all but the last prompt token (the last token is deferred to
-    // the first forward()/forward_batch(), matching the Python
+    // the first forward()/forward_batch_topk(), matching the Python
     // implementation). batch_idx must be 0. Both modes; commits to seq 0.
     void prefill(
         const std::vector<llama_token>& input_ids,
@@ -95,18 +95,6 @@ public:
         int32_t cache_batch_index,
         int32_t cache_seq_index);
 
-    // Tree mode only: decodes one batch of draft nodes -- typically all the
-    // candidates of one tree level -- each row under its own sequence, and
-    // returns the concatenated logits (input_ids.size() rows of n_vocab()
-    // floats, in row order). Rows may share a position as long as their
-    // seq_ids differ; llama.cpp derives the tree mask from (seq tags, pos).
-    // slot_indices carries the rows' tree slots for the forward log only.
-    std::vector<float> forward_batch(
-        const std::vector<llama_token>& input_ids,
-        const std::vector<llama_pos>& position_ids,
-        const std::vector<int32_t>& seq_ids,
-        const std::vector<int32_t>& slot_indices);
-
     // Per-row top-k result of forward_batch_topk(). ids[r*k + j] and
     // logprobs[r*k + j] are the j-th best continuation of input row r and
     // its log-probability under the *full* vocabulary distribution -- the
@@ -119,11 +107,16 @@ public:
         std::vector<float> logprobs;
     };
 
-    // Tree mode with Config::draft_top_k > 0 only. Same decode as
-    // forward_batch(), but the softmax and top-k run on the backend as part
-    // of the decode graph, and only k ids + k probabilities per row come
-    // back instead of a full n_vocab row. For a 151,936-entry vocabulary at
-    // 32 beams that is ~19 MB per level replaced by ~4 KB.
+    // Tree mode only: decodes one batch of draft nodes -- typically all the
+    // candidates of one tree level -- each row under its own sequence. Rows
+    // may share a position as long as their seq_ids differ; llama.cpp
+    // derives the tree mask from (seq tags, pos). slot_indices carries the
+    // rows' tree slots for the forward log only.
+    //
+    // The softmax and top-k are graph nodes, so they run on the backend and
+    // only k ids + k probabilities per row come back rather than a full
+    // n_vocab row -- for a 151,936-entry vocabulary at 32 beams, ~19 MB per
+    // level replaced by ~4 KB.
     TopKRows forward_batch_topk(
         const std::vector<llama_token>& input_ids,
         const std::vector<llama_pos>& position_ids,
@@ -166,9 +159,8 @@ public:
     int32_t seq_len() const { return seq_len_; }
     int32_t max_seqs() const { return max_seqs_; }
     bool tree_mode() const { return tree_mode_; }
-    // > 0 when a backend sampler is attached, i.e. forward_batch_topk() is
-    // available and forward_batch() is not (llama.cpp no longer copies raw
-    // logits back). Lets callers keep a host-scoring path for comparison.
+    // The attached sampler's k. Callers index forward_batch_topk()'s rows
+    // against this, so it must match their branch width.
     int32_t draft_top_k() const { return draft_top_k_; }
     // Exposed so callers can tokenize/detokenize prompts themselves, the
     // same way graph.py leaves tokenization to an external HF tokenizer.

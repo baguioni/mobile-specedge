@@ -11,7 +11,6 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
-#include <queue>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -120,35 +119,6 @@ std::string Detokenize(const llama_vocab* vocab, const std::vector<llama_token>&
         }
         return fallback + ">";
     }
-}
-
-// Indices of the k largest entries of row[0..n), highest first. Ties break
-// toward the lower index, so the selection is deterministic (torch.topk's
-// tie order is unspecified).
-std::vector<int32_t> TopKIndices(const float* row, int32_t n, int32_t k) {
-    k = std::min(k, n);
-    // Min-heap of (value, -index) so the weakest kept entry is on top and
-    // equal values prefer the lower index.
-    using Entry = std::pair<float, int32_t>;
-    auto worse = [](const Entry& a, const Entry& b) {
-        if (a.first != b.first) return a.first > b.first;
-        return a.second < b.second;  // higher index is "worse" on ties
-    };
-    std::priority_queue<Entry, std::vector<Entry>, decltype(worse)> heap(worse);
-    for (int32_t i = 0; i < n; ++i) {
-        if (static_cast<int32_t>(heap.size()) < k) {
-            heap.push({row[i], i});
-        } else if (row[i] > heap.top().first) {
-            heap.pop();
-            heap.push({row[i], i});
-        }
-    }
-    std::vector<int32_t> out(heap.size());
-    for (auto it = out.rbegin(); it != out.rend(); ++it) {
-        *it = heap.top().second;
-        heap.pop();
-    }
-    return out;
 }
 
 } // namespace
@@ -272,8 +242,6 @@ int32_t SpecExecClient::AllocSeq() {
 
 void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
     stats.forward_ms.clear();
-    stats.softmax_ms.clear();
-    stats.topk_ms.clear();
     stats.fork_ms.clear();
     stats.n_beams.clear();
 
@@ -289,14 +257,11 @@ void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
 
     const float kDecayFactor = std::log(0.9f);
     const int32_t width = config_.max_branch_width;
-    const int32_t n_vocab = engine_.n_vocab();
 
-    // Backend scoring is on when the engine was built with a top-k sampler.
-    // Its k has to be exactly the branch width: the sampler decides how many
-    // children each beam gets, and flat_ids/flat_scores below are indexed
-    // b * width + k against what it returns.
-    const bool backend_topk = engine_.draft_top_k() > 0;
-    if (backend_topk && engine_.draft_top_k() != width) {
+    // The engine's sampler decides how many children each beam gets, and
+    // flat_ids/flat_scores below are indexed b * width + k against what it
+    // returns, so its k has to be exactly the branch width.
+    if (engine_.draft_top_k() != width) {
         throw std::runtime_error(
             "SpecExecClient: engine draft_top_k=" + std::to_string(engine_.draft_top_k()) +
             " does not match max_branch_width=" + std::to_string(width) +
@@ -351,19 +316,13 @@ void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
         }
 
         // One llama_decode for the whole tree level: rows may share a
-        // position because each lives on its own sequence.
-        // With a backend sampler attached the softmax and top-k are graph
-        // nodes, so they are inside this span rather than after it, and only
-        // width ids + log-probs per row come back instead of a full
-        // n_vocab row.
+        // position because each lives on its own sequence. The softmax and
+        // top-k are graph nodes inside this call, so their cost lands in
+        // this span and only width ids + log-probs per row come back
+        // instead of a full n_vocab row.
         SteadyClock::time_point forward_start = SteadyClock::now();
-        std::vector<float> logits;
-        LlamaCppEngine::TopKRows top;
-        if (backend_topk) {
-            top = engine_.forward_batch_topk(in_tokens, in_pos, in_seqs, candidates);
-        } else {
-            logits = engine_.forward_batch(in_tokens, in_pos, in_seqs, candidates);
-        }
+        LlamaCppEngine::TopKRows top =
+            engine_.forward_batch_topk(in_tokens, in_pos, in_seqs, candidates);
         stats.forward_ms.push_back(MillisSince(forward_start));
         stats.n_beams.push_back(n_beams);
 
@@ -376,85 +335,21 @@ void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
         }
 
         // ---- _get_next_beams ----
+        // The engine already normalized over the full vocabulary and kept
+        // the best `width` per row, in (row, rank) order -- the same layout
+        // as flat_ids/flat_scores -- so a child's score is just its parent's
+        // plus the decay plus its log-prob.
         const int32_t n_flat = n_beams * width;
         std::vector<llama_token> flat_ids(n_flat);
         std::vector<float> flat_scores(n_flat);
-        // On the host path both spans below are O(n_beams * n_vocab) scalar
-        // sweeps; a clock pair per beam costs tens of nanoseconds against
-        // their tens of milliseconds, so the instrumentation is free at this
-        // scale. On the backend path both stay zero and the work shows up in
-        // forward instead -- which is the whole point, and why the two paths
-        // are kept side by side rather than one replacing the other.
-        double softmax_acc = 0.0;
-        double topk_acc = 0.0;
-        if (backend_topk) {
-            // engine_ returns exactly width entries per row, already in
-            // (row, rank) order -- the same layout as flat_ids/flat_scores --
-            // and already normalized over the full vocabulary, so the score
-            // is just the parent's plus the decay plus this log-prob.
-            for (int32_t b = 0; b < n_beams; ++b) {
-                for (int32_t k = 0; k < width; ++k) {
-                    const int32_t f = b * width + k;
-                    flat_ids[f] = top.ids[static_cast<size_t>(f)];
-                    flat_scores[f] =
-                        beam_scores[b] + kDecayFactor + top.logprobs[static_cast<size_t>(f)];
-                }
-            }
-        } else {
         for (int32_t b = 0; b < n_beams; ++b) {
-            const float* row = logits.data() + static_cast<size_t>(b) * n_vocab;
-
-            // log_softmax denominator; top-k over raw logits equals top-k
-            // over logprobs (the shift is per-row constant).
-            SteadyClock::time_point softmax_start = SteadyClock::now();
-            float row_max = row[0];
-            for (int32_t v = 1; v < n_vocab; ++v) {
-                row_max = std::max(row_max, row[v]);
-            }
-            // Four partial accumulators, float throughout. The double
-            // version's extra precision was discarded by the cast on the
-            // log_z line below, and torch's log_softmax -- the reference
-            // this is a port of -- reduces in fp32 anyway, so this is if
-            // anything the more faithful arithmetic.
-            //
-            // Measured on the vocab-sized rows this actually sees, the
-            // narrower type is the larger half (~1.7x) and splitting the
-            // accumulator adds ~1.3x on top: a single `sum += exp(...)` is
-            // one serial dependency chain, so the core finishes each add
-            // before starting the next exp, and four chains keep several in
-            // flight. Eight chains measured only ~4% beyond four, so this
-            // is the plateau, not an arbitrary unroll. Worth the ugliness
-            // because this loop is ~half the whole decode step -- see
-            // draft.softmax in the result log.
-            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-            int32_t v = 0;
-            for (; v + 3 < n_vocab; v += 4) {
-                acc0 += std::exp(row[v] - row_max);
-                acc1 += std::exp(row[v + 1] - row_max);
-                acc2 += std::exp(row[v + 2] - row_max);
-                acc3 += std::exp(row[v + 3] - row_max);
-            }
-            for (; v < n_vocab; ++v) {
-                acc0 += std::exp(row[v] - row_max);
-            }
-            const float log_z = row_max + std::log((acc0 + acc1) + (acc2 + acc3));
-            softmax_acc += MillisSince(softmax_start);
-
-            SteadyClock::time_point topk_start = SteadyClock::now();
-            std::vector<int32_t> top_ids = TopKIndices(row, n_vocab, width);
-            topk_acc += MillisSince(topk_start);
-
             for (int32_t k = 0; k < width; ++k) {
                 const int32_t f = b * width + k;
-                flat_ids[f] = static_cast<llama_token>(top_ids[k]);
-                flat_scores[f] = beam_scores[b] + kDecayFactor + (row[top_ids[k]] - log_z);
+                flat_ids[f] = top.ids[static_cast<size_t>(f)];
+                flat_scores[f] =
+                    beam_scores[b] + kDecayFactor + top.logprobs[static_cast<size_t>(f)];
             }
         }
-        }
-        // Pushed before the budget/keep block so these stay the same length
-        // as forward_ms whichever exit the level takes below.
-        stats.softmax_ms.push_back(softmax_acc);
-        stats.topk_ms.push_back(topk_acc);
 
         const int32_t n_existing = tree_.end() - tree_.prefix_len();
         const int32_t joint_size = n_existing + n_flat;
@@ -810,12 +705,10 @@ void SpecExecClient::LogCycle(
     entry["req_idx"] = req_idx;
     entry["step_idx"] = step_idx;
     entry["draft"]["forward"] = draft_stats.forward_ms;
-    entry["draft"]["softmax"] = draft_stats.softmax_ms;
-    entry["draft"]["topk"] = draft_stats.topk_ms;
     entry["draft"]["fork"] = draft_stats.fork_ms;
     entry["draft"]["n_beams"] = draft_stats.n_beams;
     entry["draft"]["end_to_end"] = draft_end_to_end_ms;
-    // What draft.end_to_end holds that the four spans above do not: the
+    // What draft.end_to_end holds that the two spans above do not: the
     // candidate scan, the joint-budget nth_element, and TrimByBudget. All
     // are O(max_budget), so a residual anywhere near the spans means the
     // cost is somewhere this breakdown does not yet look.
@@ -823,8 +716,7 @@ void SpecExecClient::LogCycle(
         return std::accumulate(v.begin(), v.end(), 0.0);
     };
     entry["draft"]["residual"] =
-        draft_end_to_end_ms - sum(draft_stats.forward_ms) - sum(draft_stats.softmax_ms) -
-        sum(draft_stats.topk_ms) - sum(draft_stats.fork_ms);
+        draft_end_to_end_ms - sum(draft_stats.forward_ms) - sum(draft_stats.fork_ms);
     entry["target"]["client_preprocess"] = stats.preprocess_ms;
     entry["target"]["client_wait"] = stats.wait_ms;
     entry["target"]["client_postprocess"] = stats.postprocess_ms;

@@ -94,6 +94,14 @@ LlamaCppEngine::LlamaCppEngine(Config config)
       max_seqs_(config.max_seqs),
       draft_top_k_(config.draft_top_k),
       tree_mode_(config.max_seqs > 1) {
+    // Tree drafting scores on the backend, which means a sampler on every
+    // sequence -- there is no host-scoring path to fall back to.
+    if (config.max_seqs > 1 && draft_top_k_ <= 0) {
+        throw std::invalid_argument(
+            "LlamaCppEngine: tree mode requires draft_top_k > 0 (set it to the "
+            "draft's max_branch_width). Tree drafting reads its candidates "
+            "from the backend sampler.");
+    }
     if (draft_top_k_ > 0 && config.max_seqs <= 1) {
         throw std::invalid_argument(
             "LlamaCppEngine: draft_top_k requires tree mode (max_seqs > 1). "
@@ -363,16 +371,27 @@ void LlamaCppEngine::log_forward_topk(
         return;
     }
 
-    // Same record shape as log_forward, except the argmax comes from the
-    // sampler's best candidate rather than a host scan -- the full logits
-    // row no longer exists on this side of the bus.
+    // Same record shape as log_forward, except the argmax is the best of the
+    // sampler's k candidates rather than a host scan over the full logits
+    // row, which no longer exists on this side of the bus.
+    //
+    // Scan for it rather than taking index 0: ggml_top_k documents that its
+    // output is unordered, and the CPU kernel actively swaps the first two
+    // entries to stop callers depending on an order. The k candidates do
+    // contain the argmax, just not necessarily first.
     std::vector<int32_t> argmax_ids;
     std::vector<llama_token> argmax_tokens;
     argmax_ids.reserve(static_cast<size_t>(top.n_rows));
     for (int32_t r = 0; r < top.n_rows; ++r) {
-        const llama_token best = top.ids[static_cast<size_t>(r) * top.k];
-        argmax_ids.push_back(static_cast<int32_t>(best));
-        argmax_tokens.push_back(best);
+        const size_t base = static_cast<size_t>(r) * top.k;
+        size_t best = base;
+        for (int32_t j = 1; j < top.k; ++j) {
+            if (top.logprobs[base + j] > top.logprobs[best]) {
+                best = base + j;
+            }
+        }
+        argmax_ids.push_back(static_cast<int32_t>(top.ids[best]));
+        argmax_tokens.push_back(top.ids[best]);
     }
 
     nlohmann::json entry;
@@ -446,53 +465,12 @@ void LlamaCppEngine::require_mode(bool tree, const char* method) const {
     }
 }
 
-std::vector<float> LlamaCppEngine::forward_batch(
-    const std::vector<llama_token>& input_ids,
-    const std::vector<llama_pos>& position_ids,
-    const std::vector<int32_t>& seq_ids,
-    const std::vector<int32_t>& slot_indices) {
-    require_mode(/*tree=*/true, "forward_batch");
-
-    const int32_t n = static_cast<int32_t>(input_ids.size());
-    if (n == 0) {
-        throw std::invalid_argument("forward_batch: empty batch");
-    }
-    if (position_ids.size() != input_ids.size() || seq_ids.size() != input_ids.size() ||
-        slot_indices.size() != input_ids.size()) {
-        throw std::invalid_argument("forward_batch: inconsistent input sizes");
-    }
-    if (n > n_batch_) {
-        throw std::invalid_argument(
-            "forward_batch: " + std::to_string(n) + " rows exceeds n_batch=" +
-            std::to_string(n_batch_));
-    }
-
-    for (int32_t i = 0; i < n; ++i) {
-        if (seq_ids[i] < 0 || seq_ids[i] >= max_seqs_) {
-            throw std::invalid_argument(
-                "forward_batch: seq_id " + std::to_string(seq_ids[i]) +
-                " out of [0, max_seqs=" + std::to_string(max_seqs_) + ")");
-        }
-        batch_set(i, input_ids[i], position_ids[i], seq_ids[i], /*want_logits=*/true);
-    }
-    decode(n);
-
-    std::vector<float> logits = read_logits(n);
-    log_forward(input_ids, position_ids, slot_indices, logits);
-    return logits;
-}
-
 LlamaCppEngine::TopKRows LlamaCppEngine::forward_batch_topk(
     const std::vector<llama_token>& input_ids,
     const std::vector<llama_pos>& position_ids,
     const std::vector<int32_t>& seq_ids,
     const std::vector<int32_t>& slot_indices) {
     require_mode(/*tree=*/true, "forward_batch_topk");
-    if (draft_top_k_ <= 0) {
-        throw std::logic_error(
-            "forward_batch_topk requires Config::draft_top_k > 0; without it "
-            "no backend sampler is attached and llama.cpp returns raw logits.");
-    }
 
     const int32_t n = static_cast<int32_t>(input_ids.size());
     if (n == 0) {
@@ -668,7 +646,7 @@ std::vector<float> LlamaCppEngine::forward(
         throw std::invalid_argument(
             "cache_seq_indices=" + std::to_string(cache_seq_index) +
             " != position_ids=" + std::to_string(position_id) +
-            ". Tree drafting goes through forward_batch() in tree mode.");
+            ". Tree drafting goes through forward_batch_topk() in tree mode.");
     }
     // llama.cpp appends; it cannot overwrite a cell in place. A gap or an
     // overlap here means the KV cache and the tree have diverged.

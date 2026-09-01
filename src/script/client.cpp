@@ -72,10 +72,6 @@ struct ClientConfig {
     int32_t max_seqs = 0;  // llama.cpp sequences; 0 = derive from the above
     int32_t max_new_tokens = 64;
     int32_t client_idx = 0;
-    // Score the draft tree on the device (softmax + top-k as graph nodes,
-    // no raw-logits copy back) instead of on the host. Off by default: the
-    // llama.cpp backend sampling API it rests on is marked EXPERIMENTAL.
-    bool backend_topk = false;
 
     // dataset selection (mirrors client.py's config fields); the dataset
     // file is always looked up under ./data.
@@ -132,7 +128,6 @@ ClientConfig load_config(const std::string& path) {
     c.max_seqs = node_or<int32_t>(cl["max_seqs"], c.max_seqs);
     c.max_new_tokens = node_or<int32_t>(cl["max_new_tokens"], c.max_new_tokens);
     c.client_idx = node_or<int32_t>(cl["client_idx"], c.client_idx);
-    c.backend_topk = node_or<bool>(cl["backend_topk"], c.backend_topk);
 
     c.dataset = node_or<std::string>(cl["dataset"], c.dataset);
     c.reasoning = node_or<bool>(cl["reasoning"], c.reasoning);
@@ -332,10 +327,9 @@ int main(int argc, char** argv) {
         engine_config.single_gpu = cfg.single_gpu;
         engine_config.n_threads = cfg.n_threads;
         engine_config.n_threads_batch = cfg.n_threads_batch;
-        // Scores the draft tree on the device: the sampler's k is the branch
-        // width because it decides each beam's children. 0 falls back to
-        // scoring on the host. See topk_sampler.h.
-        engine_config.draft_top_k = cfg.backend_topk ? cfg.max_branch_width : 0;
+        // Scores the draft tree on the device; the sampler's k is the branch
+        // width because it decides each beam's children. See topk_sampler.h.
+        engine_config.draft_top_k = cfg.max_branch_width;
         engine_config.role = "tree_client";
 
         specedge::LlamaCppEngine engine(engine_config);

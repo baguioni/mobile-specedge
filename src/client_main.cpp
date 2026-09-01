@@ -184,6 +184,9 @@ int main(int argc, char** argv) {
         engine_config.n_gpu_layers = args.n_gpu_layers;
         engine_config.n_threads = args.n_threads;
         engine_config.n_threads_batch = args.n_threads_batch;
+        // Tree mode reads its candidates from the backend sampler, whose k
+        // must be the branch width. See topk_sampler.h.
+        engine_config.draft_top_k = args.max_branch_width;
         engine_config.role = "tree_client";
 
         specedge::LlamaCppEngine engine(engine_config);
