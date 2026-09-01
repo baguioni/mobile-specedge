@@ -1,57 +1,21 @@
-# Config for the batch client (src/script/client.cpp -> `client` binary).
-#
-# Run:  ./build/client --config config/client.example.yaml
-# Invoke from the project root: datasets are read from ./data and model
-# paths are resolved relative to the current working directory.
-
 client:
-  # GGUF draft model run locally through llama.cpp.
   draft_model: models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf
-  # Layers to offload to GPU (-1 = all, 0 = CPU only).
-  n_gpu_layers: 0
+  n_gpu_layers: -1
   main_gpu: 0
-  # Thread counts; null lets llama.cpp pick its default.
   n_threads: null
   n_threads_batch: null
-
-  # Address of the running SpecEdgeService target.
-  host: 127.0.0.1:8000
-  # attention_mask wire dtype. The Validate proto carries no dtype tag, so
-  # this must equal the server's base.dtype (SPECEDGE_DTYPE). One of
-  # fp32, fp16, bf16.
+  host: mango1:8000
   dtype: fp16
-  # Context budget shared by prompt + generation.
   max_len: 2048
-  # SpecExec tree-drafting parameters (see spec_exec_client.h). Note the
-  # server sizes its buffers from its own max_budget: keep this max_budget
-  # equal to the server's SPECEDGE_MAX_BUDGET.
-  # Candidates expanded per draft step.
   max_n_beams: 4
-  # Draft steps (max tree depth added) per round.
   max_beam_len: 8
-  # Children sampled per expanded candidate.
   max_branch_width: 2
-  # Draft-node budget per round.
   max_budget: 16
-  # llama.cpp sequences (concurrent draft branches); null/0 derives an upper
-  # bound from the parameters above. Capped at 256 (LLAMA_MAX_SEQ).
   max_seqs: null
-  # Tokens to generate per request (stops early on end-of-generation).
   max_new_tokens: 64
-  # Seeds the per-client shuffle of the request order.
   client_idx: 0
-
-  # Dataset name. Read from data/<name>_prompts.json, except specbench which
-  # is data/specbench_prompts.jsonl (chat-templated).
-  # One of: mtbench, c4, oasst, wikitext, specbench.
-  dataset: mtbench
-  # Only affects specbench (enable_thinking on the chat template); ignored
-  # by this client since llama.cpp's template has no thinking toggle.
+  dataset: specbench
   reasoning: false
-  # -1 = whole dataset, otherwise an absolute upper index (matches client.py:
-  # slice is dataset[req_offset : max_request_num]).
   max_request_num: -1
-
   req_offset: 0
-  # Take every Nth prompt after the offset (1 = every prompt).
-  sample_req_cnt: 1
+  sample_req_cnt: 8

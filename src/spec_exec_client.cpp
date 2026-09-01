@@ -734,7 +734,9 @@ void SpecExecClient::LogCycle(
     entry["num_accepted_tokens"] = stats.num_accepted_tokens;
 
     std::lock_guard<std::mutex> lock(g_result_log_mutex);
-    *result_log_ << entry.dump() << "\n";
+    *result_log_ << entry.dump(-1, ' ', false,
+                               nlohmann::json::error_handler_t::replace)
+                 << "\n";
     result_log_->flush();
 }
 

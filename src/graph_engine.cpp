@@ -300,7 +300,12 @@ void LlamaCppEngine::log_forward(
     entry["argmax_string"] = detokenize(argmax_tokens);
 
     std::lock_guard<std::mutex> lock(g_forward_log_mutex);
-    *forward_log_ << entry.dump() << "\n";
+    // detokenize() can return a piece that ends mid-UTF-8-character (a single
+    // draft/argmax token is often half a multi-byte codepoint); the default
+    // dump() throws type_error.316 on that. Replace bad bytes instead.
+    *forward_log_ << entry.dump(-1, ' ', false,
+                                nlohmann::json::error_handler_t::replace)
+                  << "\n";
     forward_log_->flush();
 }
 

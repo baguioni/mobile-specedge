@@ -16,7 +16,7 @@ message ValidateRequest {
     bytes parent_indices = 6;
     bytes attention_mask = 7;
     bool prefill = 8;
-    optional string prefix = 9;
+    string prefix = 9;
 }
 
 message ValidateResponse {
