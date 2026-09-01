@@ -123,6 +123,11 @@ void LlamaCppEngine::load_model(const Config& config) {
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = config.n_gpu_layers;
+    // LAYER (the llama.cpp default) splits the model across every visible
+    // CUDA device; NONE keeps the whole model on main_gpu. main_gpu only
+    // selects the sole device under NONE.
+    model_params.split_mode =
+        config.single_gpu ? LLAMA_SPLIT_MODE_NONE : LLAMA_SPLIT_MODE_LAYER;
     model_params.main_gpu = config.main_gpu;
 
     log_info("Loading GGUF model: %s", config.model_path.c_str());

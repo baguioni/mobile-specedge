@@ -141,15 +141,21 @@ For the `client` batch binary, set it in the YAML:
 client:
   n_gpu_layers: -1   # -1 = all layers, 0 = CPU only
   main_gpu: 0        # which CUDA device to use
+  single_gpu: true   # whole model on main_gpu only; false splits layers across all visible GPUs
 ```
 
 `--n-gpu-layers -1` (or `n_gpu_layers: -1`) offloads all layers; a positive
 value offloads that many. `graph_engine` and `tree_client` expose only
 `--n-gpu-layers` and always use device 0 — select another card with
 `CUDA_VISIBLE_DEVICES=1 ./build/tree_client …`. The `client` binary also
-takes `main_gpu:` in the YAML to pick the CUDA device directly. On load,
-llama.cpp logs lines like `load_tensors: offloaded 29/29 layers to GPU` —
-check those to confirm the draft model is actually on the GPU.
+takes `main_gpu:` in the YAML to pick the CUDA device directly.
+
+By default every binary now loads with llama.cpp's `LLAMA_SPLIT_MODE_NONE`,
+so the draft model stays on a single GPU (`main_gpu`). Set `single_gpu: false`
+in the `client` YAML to restore llama.cpp's default layer-split across all
+visible CUDA devices. On load, llama.cpp logs lines like
+`load_tensors: offloaded 29/29 layers to GPU` — check those to confirm the
+draft model is actually on the GPU.
 
 ### Regenerating the gRPC stubs (only if needed)
 

@@ -52,6 +52,9 @@ struct ClientConfig {
     std::string draft_model;
     int32_t n_gpu_layers = 0;
     int32_t main_gpu = 0;
+    // true (default) pins the draft model to a single GPU (main_gpu);
+    // false lets llama.cpp split its layers across all visible GPUs.
+    bool single_gpu = true;
     std::optional<uint32_t> n_threads;
     std::optional<uint32_t> n_threads_batch;
 
@@ -107,6 +110,7 @@ ClientConfig load_config(const std::string& path) {
     c.draft_model = node_or<std::string>(cl["draft_model"], c.draft_model);
     c.n_gpu_layers = node_or<int32_t>(cl["n_gpu_layers"], c.n_gpu_layers);
     c.main_gpu = node_or<int32_t>(cl["main_gpu"], c.main_gpu);
+    c.single_gpu = node_or<bool>(cl["single_gpu"], c.single_gpu);
     if (cl["n_threads"] && !cl["n_threads"].IsNull()) {
         c.n_threads = cl["n_threads"].as<uint32_t>();
     }
@@ -320,6 +324,7 @@ int main(int argc, char** argv) {
         engine_config.max_seqs = cfg.max_seqs > 0 ? cfg.max_seqs : derive_max_seqs(cfg);
         engine_config.n_gpu_layers = cfg.n_gpu_layers;
         engine_config.main_gpu = cfg.main_gpu;
+        engine_config.single_gpu = cfg.single_gpu;
         engine_config.n_threads = cfg.n_threads;
         engine_config.n_threads_batch = cfg.n_threads_batch;
         engine_config.role = "tree_client";

@@ -1,7 +1,8 @@
 client:
-  draft_model: models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf
+  draft_model: models/Qwen3-0.6B-GGUF/Qwen3-0.6B-f16.gguf
   n_gpu_layers: -1
   main_gpu: 0
+  single_gpu: true   # true: whole draft model on main_gpu only; false: split layers across all visible GPUs
   n_threads: null
   n_threads_batch: null
   host: mango1:8000

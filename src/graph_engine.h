@@ -51,6 +51,12 @@ public:
         int32_t max_seqs = 1;
         int32_t n_gpu_layers = 0;
         int32_t main_gpu = 0;
+        // Pin the whole model to a single GPU (main_gpu). true selects
+        // llama.cpp's LLAMA_SPLIT_MODE_NONE; false restores the library
+        // default (LLAMA_SPLIT_MODE_LAYER), which spreads layers across
+        // every visible CUDA device. Only meaningful with a GPU build and
+        // n_gpu_layers != 0.
+        bool single_gpu = true;
         std::string role = "unknown";
         // Optional external vocab size (e.g. an HF tokenizer's vocab_size)
         // to sanity-check against the GGUF's own vocab. Skipped if unset.
