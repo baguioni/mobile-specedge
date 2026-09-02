@@ -8,6 +8,7 @@
 #include <ctime>
 #include <exception>
 #include <filesystem>
+#include <future>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -123,6 +124,14 @@ std::string Detokenize(const llama_vocab* vocab, const std::vector<llama_token>&
 
 } // namespace
 
+SpecExecClient::ProactiveType SpecExecClient::ParseProactiveType(const std::string& name) {
+    if (name == "disabled") return ProactiveType::kDisabled;
+    if (name == "excluded") return ProactiveType::kExcluded;
+    if (name == "included") return ProactiveType::kIncluded;
+    throw std::invalid_argument(
+        "proactive.type must be one of disabled, excluded, included (got '" + name + "')");
+}
+
 SpecExecClient::SpecExecClient(
     LlamaCppEngine& engine,
     GrpcClient& validator,
@@ -146,7 +155,56 @@ SpecExecClient::SpecExecClient(
             "SpecExecClient: max_n_beams, max_beam_len, max_branch_width and "
             "max_budget must all be >= 1.");
     }
+
+    seq_in_use_.assign(static_cast<size_t>(engine_.max_seqs()), 0);
+    RebuildSeqPool();
+
+    if (config_.proactive_type != ProactiveType::kDisabled) {
+        if (config_.proactive_type == ProactiveType::kIncluded &&
+            config_.proactive.max_beam_len >= config_.max_beam_len) {
+            throw std::invalid_argument(
+                "SpecExecClient: proactive.type=included charges the subtree's depth "
+                "against max_beam_len, so proactive.max_beam_len (" +
+                std::to_string(config_.proactive.max_beam_len) +
+                ") must be less than max_beam_len (" +
+                std::to_string(config_.max_beam_len) + ").");
+        }
+        proactive_ = std::make_unique<ProactiveDraft>(
+            engine_, tree_, [this] { return AllocSeq(); }, config_.proactive);
+    }
+
     engine_.reset();
+}
+
+void SpecExecClient::RebuildSeqPool() {
+    std::fill(seq_in_use_.begin(), seq_in_use_.end(), uint8_t{0});
+    for (int32_t i = 0; i < tree_.end(); ++i) {
+        const int32_t s = tree_.seq_ids()[i];
+        if (s > 0 && s < static_cast<int32_t>(seq_in_use_.size())) {
+            seq_in_use_[static_cast<size_t>(s)] = 1;
+        }
+    }
+    seq_in_use_[0] = 1;  // canonical committed sequence, never forked onto
+    seq_cursor_ = 1;
+}
+
+int32_t SpecExecClient::AllocSeq() {
+    const int32_t n = static_cast<int32_t>(seq_in_use_.size());
+    for (int32_t i = 0; i < n; ++i) {
+        const int32_t s = (seq_cursor_ + i) % n;
+        if (s != 0 && !seq_in_use_[static_cast<size_t>(s)]) {
+            seq_in_use_[static_cast<size_t>(s)] = 1;
+            seq_cursor_ = (s + 1) % n;
+            return s;
+        }
+    }
+    throw std::runtime_error(
+        "SpecExecClient: ran out of llama.cpp sequences mid-round "
+        "(max_seqs=" + std::to_string(engine_.max_seqs()) + "). Raise the "
+        "engine's max_seqs or lower max_n_beams/max_branch_width/"
+        "max_beam_len (and their proactive counterparts). Seq ids are never "
+        "recycled within a round: a pruned branch's cells may still back the "
+        "accepted prefix.");
 }
 
 std::vector<llama_token> SpecExecClient::Generate(int32_t req_idx, GenerateTrace* trace) {
@@ -242,18 +300,6 @@ std::vector<llama_token> SpecExecClient::RunCycle(int32_t req_idx, int32_t step_
     return fresh_tokens;
 }
 
-int32_t SpecExecClient::AllocSeq() {
-    if (next_seq_ >= engine_.max_seqs()) {
-        throw std::runtime_error(
-            "SpecExecClient: ran out of llama.cpp sequences mid-round "
-            "(max_seqs=" + std::to_string(engine_.max_seqs()) + "). Raise the "
-            "engine's max_seqs or lower max_n_beams/max_branch_width/"
-            "max_beam_len. Seq ids are never recycled within a round: a "
-            "pruned branch's cells may still back the accepted prefix.");
-    }
-    return next_seq_++;
-}
-
 void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
     stats.forward_ms.clear();
     stats.fork_ms.clear();
@@ -267,7 +313,14 @@ void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
             break;
         }
     }
-    const int32_t max_beam_len = has_candidate ? config_.max_beam_len : 0;
+    int32_t max_beam_len = has_candidate ? config_.max_beam_len : 0;
+
+    // `included` mode pays for the spliced subtree out of this round's
+    // depth budget, so a hit shows up as a shorter draft rather than a
+    // deeper tree. `excluded` leaves the budget alone and banks the depth.
+    if (config_.proactive_type == ProactiveType::kIncluded && prev_proactive_hit_) {
+        max_beam_len = std::max(0, max_beam_len - config_.proactive.max_beam_len);
+    }
 
     const float kDecayFactor = std::log(0.9f);
     const int32_t width = config_.max_branch_width;
@@ -527,10 +580,18 @@ std::vector<llama_token> SpecExecClient::ValidateTree(
     // Target rows: every draft node. status >= PROCESSED covers both
     // decoded nodes and the last level's never-decoded CANDIDATE leaves;
     // the prefix is masked off.
+    //
+    // The kPost* pair is excluded on purpose. Those mark a proactive
+    // subtree, which belongs to the round *after* this one and must not be
+    // validated with this round's tree. This scan stops at `end` and the
+    // subtree lives past it, so today the bound already excludes them; the
+    // status test says so explicitly rather than leaving the wire contract
+    // resting on a coincidence of layout.
     std::vector<uint8_t> target_mask(static_cast<size_t>(end), 0);
     std::vector<int32_t> target_indices;
     for (int32_t i = prefix; i < end; ++i) {
-        if (tree_.status()[i] >= Tree::kProcessed) {
+        if (tree_.status()[i] >= Tree::kProcessed &&
+            tree_.status()[i] < Tree::kPostCandidate) {
             target_mask[i] = 1;
             target_indices.push_back(i);
         }
@@ -573,14 +634,59 @@ std::vector<llama_token> SpecExecClient::ValidateTree(
 
     stats.preprocess_ms = MillisSince(preprocess_start);
 
-    // Wait: blocked on the target. specexec.py's wait_t window also
-    // overlaps proactive drafting via asyncio; this client has neither, so
-    // this is purely the round-trip.
+    // Wait: the round-trip, and the window the proactive draft runs in --
+    // specexec.py's wait_t, which overlaps the two via asyncio.
+    //
+    // The split of labour is what makes this safe without locks: the worker
+    // owns the RPC and touches only the request buffers built above (which
+    // outlive it -- the future is joined before this scope ends, on the
+    // throwing path too), while the engine and the tree stay on this
+    // thread. llama_context is not thread-safe and is never handed over.
     SteadyClock::time_point wait_start = SteadyClock::now();
-    GrpcClient::ValidateResult result = validator_.Validate(
-        config_.client_idx, req_idx, input_ids, position_ids, cache_seq_indices,
-        attention_mask, target_parents, prefill,
-        prefill ? std::optional<std::string>(prompt_text_) : std::nullopt);
+
+    auto do_validate = [&]() {
+        return validator_.Validate(
+            config_.client_idx, req_idx, input_ids, position_ids, cache_seq_indices,
+            attention_mask, target_parents, prefill,
+            prefill ? std::optional<std::string>(prompt_text_) : std::nullopt);
+    };
+
+    GrpcClient::ValidateResult result;
+    std::optional<ProactiveDraft::Result> bet;
+
+    if (proactive_ == nullptr) {
+        // Nothing to overlap with, so no thread hop to pay for: this is the
+        // pre-proactive path, unchanged.
+        result = do_validate();
+    } else {
+        std::future<GrpcClient::ValidateResult> rpc =
+            std::async(std::launch::async, do_validate);
+
+        // Bet on the bonus token and pre-grow next round's tree while the
+        // target thinks. A losing bet costs only this window; a winning one
+        // is spliced in below instead of being discarded.
+        // A bet is an optimization and is never allowed to cost correctness:
+        // on any failure, drop it and take the ordinary acceptance path.
+        // That path is safe even after a partial draft -- it keeps one
+        // sequence and frees every other, which is exactly what a
+        // half-built subtree's branches are. ProactiveDraft restores the
+        // tree's bounds on the way out however it exits.
+        try {
+            bet = proactive_->Draft();
+        } catch (const std::exception& e) {
+            std::fprintf(
+                stderr, "[SpecExecClient] proactive draft failed, skipping it: %s\n",
+                e.what());
+            bet.reset();
+        }
+        stats.proactive_ms = proactive_->last_elapsed_ms();
+        stats.proactive_ran = bet.has_value();
+        if (bet.has_value()) {
+            stats.proactive_nodes = bet->end - bet->begin;
+        }
+
+        result = rpc.get();
+    }
     stats.wait_ms = MillisSince(wait_start);
 
     if (result.selection.size() < input_slots.size()) {
@@ -655,45 +761,79 @@ std::vector<llama_token> SpecExecClient::ValidateTree(
     std::fprintf(
         stderr, "[SpecExecClient] Num of accepted tokens: %zu\n", fresh_slots.size() + 1);
 
-    // ---- engine collapse: the llama.cpp replacement for python's
-    // engine.gather(seq_indices, arange). The accepted path is addressed by
-    // its (seq, pos) coordinates from the slot map: keep the deepest
-    // accepted node's primary sequence (it tags the whole root..node path,
-    // whether the node inherited it or was forked onto it), drop everything
-    // else, retag onto seq 0. Cells never move.
-    const int32_t keep_seq = tree_.seq_ids()[last_slot];
-    const llama_pos last_pos = tree_.positions()[last_slot];
-    const bool tip_undecoded = tree_.status()[last_slot] == Tree::kCandidate;
-    const llama_token tip_token = tree_.tokens()[last_slot];
+    // The bet is won only if the target agreed on both halves of it: the
+    // leaf it hung the subtree off must be the deepest accepted node, and
+    // the token it guessed must be the bonus token that actually came back.
+    const bool proactive_hit = bet.has_value() && bet->leaf_slot == last_slot &&
+                               bet->bonus_token == extra_token;
+    stats.prev_proactive_hit = prev_proactive_hit_;
+    stats.proactive_hit = proactive_hit;
+    prev_proactive_hit_ = proactive_hit;
 
-    engine_.collapse_to_seq(keep_seq, tip_undecoded ? last_pos - 1 : last_pos);
-    if (tip_undecoded) {
-        // The deepest accepted node was a frontier CANDIDATE the draft
-        // engine never decoded; close the gap so next round's seed attends
-        // to a complete prefix (the tree analogue of linear backfill()).
-        engine_.decode_token(tip_token, last_pos, /*seq_id=*/0);
-    }
-    // Every surviving cell is on seq 0 again; forked ids are free.
-    next_seq_ = 1;
-
-    // ---- tree reorder + bonus token ----
     std::vector<uint8_t> seq_mask(static_cast<size_t>(end), 0);
     for (int32_t c = 0; c < end; ++c) {
         seq_mask[c] = tree_.amask_at(best_slot, c);
     }
-    tree_.reorder_by_sequence(seq_mask);
 
-    tree_.add(
-        {extra_token},
-        {static_cast<llama_pos>(tree_.positions()[tree_.end() - 1] + 1)},
-        {tree_.end() - 1},
-        {0.0f},
-        {0},
-        Tree::kCandidate);
-    tree_.set_prefix_len(tree_.end());
-    for (int32_t i = 0; i < tree_.prefix_len() - 1; ++i) {
-        tree_.set_status(i, Tree::kPrompt);
+    if (proactive_hit) {
+        // ---- hit: keep the subtree ----
+        // Every branch of it tags the whole root..bonus path, so keeping
+        // their sequences keeps the committed prefix too; everything the
+        // target rejected is on some other sequence and is freed. No
+        // truncation and no retag onto seq 0 -- the branches have to stay
+        // distinguishable for next round's drafting.
+        //
+        // No backfill either, unlike the miss path below: the proactive
+        // draft decoded the winning leaf when it scored it, and decoded the
+        // bonus token when it grew the subtree's first level.
+        const int32_t committed_len = static_cast<int32_t>(fresh_tokens.size()) + prefix + 1;
+        engine_.collapse_to_seqs(bet->seq_ids, committed_len);
+        tree_.reorder_by_sequence_proactive(
+            seq_mask, bet->begin, bet->end, bet->root_seq_id);
+    } else {
+        // ---- miss: the llama.cpp replacement for python's
+        // engine.gather(seq_indices, arange). The accepted path is
+        // addressed by its (seq, pos) coordinates from the slot map: keep
+        // the deepest accepted node's primary sequence (it tags the whole
+        // root..node path, whether the node inherited it or was forked onto
+        // it), drop everything else -- a losing bet's branches included --
+        // and retag onto seq 0. Cells never move.
+        const int32_t keep_seq = tree_.seq_ids()[last_slot];
+        const llama_pos last_pos = tree_.positions()[last_slot];
+        // kCandidate here means "never decoded". A leaf the proactive draft
+        // scored is kProcessed by now precisely so this does not decode it
+        // a second time -- llama.cpp would append a duplicate cell at the
+        // same (seq, pos) rather than overwrite.
+        const bool tip_undecoded = tree_.status()[last_slot] == Tree::kCandidate;
+        const llama_token tip_token = tree_.tokens()[last_slot];
+
+        engine_.collapse_to_seq(keep_seq, tip_undecoded ? last_pos - 1 : last_pos);
+        if (tip_undecoded) {
+            // The deepest accepted node was a frontier CANDIDATE the draft
+            // engine never decoded; close the gap so next round's seed
+            // attends to a complete prefix (the tree analogue of linear
+            // backfill()).
+            engine_.decode_token(tip_token, last_pos, /*seq_id=*/0);
+        }
+
+        tree_.reorder_by_sequence(seq_mask);
+
+        tree_.add(
+            {extra_token},
+            {static_cast<llama_pos>(tree_.positions()[tree_.end() - 1] + 1)},
+            {tree_.end() - 1},
+            {0.0f},
+            {0},
+            Tree::kCandidate);
+        tree_.set_prefix_len(tree_.end());
+        for (int32_t i = 0; i < tree_.prefix_len() - 1; ++i) {
+            tree_.set_status(i, Tree::kPrompt);
+        }
     }
+
+    // Whatever survived now defines which sequence ids are still spoken
+    // for; the rest go back on the free list.
+    RebuildSeqPool();
 
     fresh_tokens.push_back(extra_token);
 
@@ -711,8 +851,10 @@ void SpecExecClient::LogCycle(
     double draft_end_to_end_ms,
     const TargetStats& stats,
     double target_end_to_end_ms) {
-    // Schema is specexec.py's _cycle result-logger record minus
-    // target.proactive / target.prev_proactive (no proactive draft here).
+    // Schema is specexec.py's _cycle result-logger record, plus
+    // target.proactive_ms / proactive_ran / proactive_nodes -- the three
+    // things that decide whether the bet is worth its window and that the
+    // Python logs have no equivalent of.
     nlohmann::json entry;
     entry["timestamp"] = Iso8601Now();
     entry["client_idx"] = config_.client_idx;
@@ -736,6 +878,13 @@ void SpecExecClient::LogCycle(
     entry["target"]["client_postprocess"] = stats.postprocess_ms;
     entry["target"]["end_to_end"] = target_end_to_end_ms;
     entry["target"]["prefill"] = stats.prefill_cnt;
+    // specexec.py's names for the two booleans, so metric/ can read either
+    // implementation's logs with one parser.
+    entry["target"]["proactive"] = stats.proactive_hit;
+    entry["target"]["prev_proactive"] = stats.prev_proactive_hit;
+    entry["target"]["proactive_ran"] = stats.proactive_ran;
+    entry["target"]["proactive_ms"] = stats.proactive_ms;
+    entry["target"]["proactive_nodes"] = stats.proactive_nodes;
     entry["num_accepted_tokens"] = stats.num_accepted_tokens;
 
     std::lock_guard<std::mutex> lock(g_result_log_mutex);

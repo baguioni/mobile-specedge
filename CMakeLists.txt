@@ -64,6 +64,7 @@ FetchContent_MakeAvailable(llama_cpp nlohmann_json yaml_cpp)
 # Ubuntu's libgrpc++-dev (1.16.1) does not ship CMake config files
 # (gRPCConfig.cmake), only pkg-config .pc files, so gRPC is located via
 # pkg-config rather than find_package(gRPC CONFIG).
+find_package(Threads REQUIRED)
 find_package(Protobuf REQUIRED)
 
 find_package(PkgConfig REQUIRED)
@@ -74,6 +75,7 @@ src/graph_engine.cpp
 src/grpc_client.cpp
 src/tree.cpp
 src/spec_exec_client.cpp
+src/proactive_draft.cpp
 src/topk_sampler.cpp
 src/specedge_grpc/specedge.pb.cc
 src/specedge_grpc/specedge.grpc.pb.cc
@@ -81,10 +83,23 @@ src/specedge_grpc/specedge.grpc.pb.cc
 target_include_directories(graph_engine_lib PUBLIC src ${GRPC_INCLUDE_DIRS})
 target_link_directories(graph_engine_lib PUBLIC ${GRPC_LIBRARY_DIRS})
 target_compile_options(graph_engine_lib PUBLIC ${GRPC_CFLAGS_OTHER})
-target_link_libraries(graph_engine_lib PUBLIC llama nlohmann_json::nlohmann_json protobuf::libprotobuf ${GRPC_LIBRARIES})
+target_link_libraries(graph_engine_lib PUBLIC Threads::Threads llama nlohmann_json::nlohmann_json protobuf::libprotobuf ${GRPC_LIBRARIES})
 
 # Config-driven batch client: reads a YAML config, walks a whole dataset,
 # runs each prompt through tree-based (SpecExec) speculative decoding. Port
 # of specedge/src/script/client.py.
 add_executable(client src/script/client.cpp)
 target_link_libraries(client PRIVATE graph_engine_lib yaml-cpp::yaml-cpp llama-common)
+# Regression test for Tree::reorder_by_sequence_proactive -- the slot remap a
+# winning proactive bet goes through (see src/proactive_draft.h). Tree touches
+# llama.h only for its typedefs, so this links without libllama, gRPC or a
+# target server, which is what makes the splice cheap to check. Not built by
+# default: -DSPECEDGE_BUILD_TESTS=ON, then ./build/tree_splice_test.
+option(SPECEDGE_BUILD_TESTS "Build the unit tests" OFF)
+if(SPECEDGE_BUILD_TESTS)
+  add_executable(tree_splice_test src/test/tree_splice_test.cpp src/tree.cpp)
+  target_include_directories(tree_splice_test PRIVATE src)
+  target_link_libraries(tree_splice_test PRIVATE llama)
+  enable_testing()
+  add_test(NAME tree_splice COMMAND tree_splice_test)
+endif()

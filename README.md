@@ -26,9 +26,11 @@ anything here.
 | `src/grpc_client.{h,cpp}` | `GrpcClient` — synchronous client for the `Validate` RPC. |
 | `src/tree.{h,cpp}` | `Tree` — the client-side draft tree (slots, positions, parents, attention mask). |
 | `src/spec_exec_client.{h,cpp}` | `SpecExecClient` — the draft + verify round loop (port of `specexec.py`). |
+| `src/proactive_draft.{h,cpp}` | `ProactiveDraft` — bets on the bonus token and pre-grows next round's tree inside the `Validate` round-trip (port of `proactive.py`). |
 | `src/script/client.cpp` | → `client` binary, the only executable. Config-driven batch run over a dataset. |
 | `src/config.h` | Env-var config reader kept for parity with the Python launcher. **Not used by any current binary.** |
 | `src/metric/mobile.py` | Post-run latency/throughput analysis of the JSONL result logs. |
+| `src/test/` | Unit tests; build with `-DSPECEDGE_BUILD_TESTS=ON`. |
 | `config/client.example.yaml` | Example config for the `client` binary. |
 | `data/` | Prompt datasets: `mtbench`, `c4`, `oasst`, `wikitext` (JSON `[id, text]` arrays), `specbench` (JSONL chat turns). |
 
@@ -197,13 +199,40 @@ commented list. Key fields:
 | `dtype` | `fp32` / `fp16` / `bf16` — must equal the server's model dtype |
 | `max_len` | context budget shared by prompt + generation |
 | `max_n_beams`, `max_beam_len`, `max_branch_width`, `max_budget` | SpecExec tree-drafting params (`max_budget` must equal the server's) |
-| `max_seqs` | llama.cpp sequences; `null`/`0` auto-derives, cap 256 |
+| `max_seqs` | llama.cpp sequences; `null`/`0` auto-derives (proactive branches included), cap 256 |
+| `proactive.type` | `disabled` (default), `excluded`, or `included` — see below |
+| `proactive.max_n_beams`, `.max_beam_len`, `.max_branch_width`, `.max_budget` | subtree shape; `max_branch_width` must be `<=` the top-level one |
 | `max_new_tokens` | tokens generated per request |
 | `client_idx` | seeds the per-client request shuffle; names the output log |
 | `dataset` | one of `mtbench`, `c4`, `oasst`, `wikitext`, `specbench` |
 | `max_request_num` | `-1` = whole dataset, else absolute upper index |
 | `req_offset`, `sample_req_cnt` | start index, and take every Nth prompt |
 | `n_gpu_layers`, `main_gpu`, `n_threads`, `n_threads_batch` | llama.cpp placement / threading |
+
+### Proactive draft
+
+With `proactive.type` set to anything but `disabled`, the `Validate` RPC moves
+to a worker thread and the draft model spends the round-trip betting on the
+bonus token the target is about to return, pre-growing next round's tree from
+that bet. A hit splices the subtree in; a miss discards it and costs only the
+window it ran in. `excluded` banks the hit as a deeper tree; `included` banks
+it as a shorter draft, reducing `max_beam_len` by `proactive.max_beam_len`
+(which must therefore be strictly smaller).
+
+Only work that fits inside the round-trip is free, so `proactive.max_beam_len`
+is the parameter to tune — one unit costs roughly one draft level. Every round
+logs what it needs to size it:
+
+| field in `client_<idx>.jsonl` | |
+|---|---|
+| `target.client_wait` | the window available (RPC + overlapped draft) |
+| `target.proactive_ms` | what the bet actually cost |
+| `target.proactive_ran` | a bet was placed |
+| `target.proactive` / `.prev_proactive` | it was right (this round / the previous one) |
+| `target.proactive_nodes` | subtree size, spliced or discarded |
+
+A hit rate near zero, or `proactive_ms` well over `client_wait`, means the
+setting is costing more than it returns.
 
 ---
 

@@ -22,8 +22,6 @@ namespace specedge {
 //  - amask is uint8_t 0/1 (max_len x max_len, row-major) instead of a
 //    model-dtype tensor; attention_mask_rows() expands the requested rows to
 //    float for the RPC wire format.
-//  - No POST_CANDIDATE / POST_PROCESSED statuses: they exist only for the
-//    proactive draft, which has no port here (see linearspecexec.py's note).
 //  - seq_ids: one extra per-slot array tree.py does not have -- the
 //    llama.cpp bridge, see below.
 //
@@ -50,15 +48,22 @@ namespace specedge {
 // mapping survives slot permutation (budget trims). reorder_by_sequence()
 // resets it to seq 0, matching the engine-side collapse of the accepted path
 // onto the canonical sequence at the end of every round.
+// reorder_by_sequence_proactive() is the exception: a hit keeps several
+// branches alive, so it preserves the surviving nodes' seq ids instead.
 class Tree {
 public:
-    // Mirrors tree.py's status constants; ordering matters (the Validate
-    // row selection uses status >= kProcessed).
+    // Mirrors tree.py's status constants; ordering matters. The Validate row
+    // selection uses `status >= kProcessed && status < kPostCandidate`: the
+    // kPost* pair marks nodes the proactive draft speculated past the bonus
+    // token, which belong to *next* round's tree and must never be shipped
+    // to the target with this round's.
     enum Status : int32_t {
         kPrompt = 0,
         kGenerated = 5,
         kProcessed = 10,
         kCandidate = 15,
+        kPostCandidate = 20,
+        kPostProcessed = 25,
     };
 
     // Mirrors Tree._initialize_data: seeds slots [0, prefix_len) as a causal
@@ -82,6 +87,13 @@ public:
     // Mirrors the Python client assigning tree.prefix_len directly after
     // appending the bonus token.
     void set_prefix_len(int32_t prefix_len);
+
+    // Mirrors the Python proactive draft assigning tree.end directly to
+    // unwind its scratch growth. Slots [end, max_len) hold whatever the
+    // proactive draft last wrote there; ProactiveDraft is the only caller,
+    // and it keeps the bounds of that live scratch region itself. Must not
+    // be used to grow `end` over slots that were never written by add().
+    void set_end(int32_t end);
 
     // Mirrors Tree.add: appends the nodes at slots [end, end + add_size).
     // parent_indices must reference existing slots (< end); each new node's
@@ -111,6 +123,31 @@ public:
     // collapse every committed cell lives on the canonical seq 0.
     // seq_mask must have end() entries.
     void reorder_by_sequence(const std::vector<uint8_t>& seq_mask);
+
+    // Mirrors specexec.py's _reorder_by_sequence_proactive: the acceptance
+    // path taken when the proactive draft's bet was right. Compacts the
+    // accepted path to the front exactly as reorder_by_sequence does, then
+    // moves the speculative subtree at slots [pro_begin, pro_end) in behind
+    // it, remapping its parents through the same permutation and promoting
+    // kPost* back to their live equivalents.
+    //
+    // Unlike reorder_by_sequence this preserves seq ids: the subtree's
+    // branches are still live llama.cpp sequences, and the committed prefix
+    // is retagged onto `prefix_seq_id` (any sequence tagging the whole
+    // root..bonus path -- the subtree root's own is the natural choice).
+    //
+    // The speculative nodes keep their positions unchanged, which is only
+    // sound because the accepted path's positions are already dense and
+    // equal to their new slots; that is checked, not assumed.
+    //
+    // seq_mask must have end() entries and cover the whole prefix, and
+    // pro_begin must be the subtree root -- a node whose parent is inside
+    // the accepted set and at or beyond the old prefix.
+    void reorder_by_sequence_proactive(
+        const std::vector<uint8_t>& seq_mask,
+        int32_t pro_begin,
+        int32_t pro_end,
+        int32_t prefix_seq_id);
 
     uint8_t amask_at(int32_t row, int32_t col) const;
 

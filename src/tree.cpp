@@ -62,6 +62,13 @@ void Tree::set_prefix_len(int32_t prefix_len) {
     prefix_len_ = prefix_len;
 }
 
+void Tree::set_end(int32_t end) {
+    if (end < prefix_len_ || end > max_len_) {
+        throw std::invalid_argument("Tree::set_end: end out of [prefix_len, max_len]");
+    }
+    end_ = end;
+}
+
 void Tree::add(
     const std::vector<llama_token>& token_ids,
     const std::vector<llama_pos>& token_positions,
@@ -270,6 +277,149 @@ void Tree::reorder_by_sequence(const std::vector<uint8_t>& seq_mask) {
     }
 
     init_attention_mask();
+}
+
+void Tree::reorder_by_sequence_proactive(
+    const std::vector<uint8_t>& seq_mask,
+    int32_t pro_begin,
+    int32_t pro_end,
+    int32_t prefix_seq_id) {
+    if (static_cast<int32_t>(seq_mask.size()) != end_) {
+        throw std::invalid_argument(
+            "Tree::reorder_by_sequence_proactive: seq_mask must have end() entries");
+    }
+    if (pro_begin < end_ || pro_end <= pro_begin || pro_end > max_len_) {
+        throw std::invalid_argument(
+            "Tree::reorder_by_sequence_proactive: [pro_begin, pro_end) must be a "
+            "non-empty scratch range at or past end()");
+    }
+    for (int32_t i = 0; i < prefix_len_; ++i) {
+        if (!seq_mask[i]) {
+            throw std::invalid_argument(
+                "Tree::reorder_by_sequence_proactive: seq_mask must cover the whole prefix");
+        }
+    }
+
+    std::vector<int32_t> seq_indices;
+    for (int32_t i = 0; i < end_; ++i) {
+        if (seq_mask[i]) {
+            seq_indices.push_back(i);
+        }
+    }
+    const int32_t new_prefix_len = static_cast<int32_t>(seq_indices.size());
+    const int32_t n_pro = pro_end - pro_begin;
+
+    if (new_prefix_len + n_pro > max_len_) {
+        throw std::invalid_argument(
+            "Tree::reorder_by_sequence_proactive: spliced tree would exceed max_len");
+    }
+
+    // Old slot -> new slot, for remapping the subtree's parents. Only the
+    // accepted nodes and the subtree itself are ever looked up.
+    std::vector<int32_t> mapping(static_cast<size_t>(pro_end), -1);
+    for (int32_t i = 0; i < new_prefix_len; ++i) {
+        mapping[seq_indices[i]] = i;
+    }
+
+    // ---- accepted path, compacted to [0, new_prefix_len) ----
+    // Same relinearization as reorder_by_sequence: dest <= src throughout,
+    // so the forward loop never overwrites an unread source.
+    for (int32_t i = prefix_len_; i < new_prefix_len; ++i) {
+        const int32_t s = seq_indices[i];
+        tokens_[i] = tokens_[s];
+        positions_[i] = static_cast<llama_pos>(i);
+        parents_[i] = i - 1;
+    }
+
+    // The subtree's positions are carried over untouched below, which is
+    // only sound if the accepted path already ends exactly where the
+    // subtree begins. It does -- the accepted path is one root-to-leaf
+    // walk, so its positions are dense -- but this is load-bearing enough
+    // to check rather than assume.
+    const int32_t root_parent_old = parents_[pro_begin];
+    if (mapping[root_parent_old] != new_prefix_len - 1) {
+        throw std::runtime_error(
+            "Tree::reorder_by_sequence_proactive: the subtree root's parent is not "
+            "the deepest accepted node; the bet and the acceptance disagree.");
+    }
+    if (positions_[pro_begin] != static_cast<llama_pos>(new_prefix_len)) {
+        throw std::runtime_error(
+            "Tree::reorder_by_sequence_proactive: subtree root position " +
+            std::to_string(positions_[pro_begin]) + " does not match its new slot " +
+            std::to_string(new_prefix_len) + "; positions and slots have diverged.");
+    }
+
+    // ---- speculative subtree, moved in behind it ----
+    // Ascending src -> ascending dest, and every parent is either an
+    // accepted node or an earlier subtree node, so parents stay at lower
+    // slots than their children and reads precede the writes that clobber.
+    for (int32_t k = 0; k < n_pro; ++k) {
+        const int32_t s = pro_begin + k;
+        const int32_t d = new_prefix_len + k;
+        const int32_t mapped_parent = mapping[parents_[s]];
+        if (mapped_parent < 0) {
+            throw std::runtime_error(
+                "Tree::reorder_by_sequence_proactive: subtree node at slot " +
+                std::to_string(s) + " has a parent outside the accepted set");
+        }
+        mapping[s] = d;
+
+        tokens_[d] = tokens_[s];
+        positions_[d] = positions_[s];
+        parents_[d] = mapped_parent;
+        logprobs_[d] = logprobs_[s];
+        seq_ids_[d] = seq_ids_[s];
+        // kPost* marked "belongs to the next round"; that is now.
+        status_[d] = status_[s] == kPostCandidate  ? kCandidate
+                     : status_[s] == kPostProcessed ? kProcessed
+                                                    : status_[s];
+    }
+
+    end_ = new_prefix_len + n_pro;
+    // The bonus token -- the subtree's root -- is committed, so the prefix
+    // runs one past the accepted path.
+    prefix_len_ = new_prefix_len + 1;
+
+    for (int32_t i = 0; i < new_prefix_len; ++i) {
+        status_[i] = kPrompt;
+        logprobs_[i] = 0.0f;
+    }
+    // Every kept branch tags the whole root..bonus path, so any one of them
+    // addresses the committed prefix; the caller passes the subtree root's.
+    for (int32_t i = 0; i < prefix_len_; ++i) {
+        seq_ids_[i] = prefix_seq_id;
+    }
+    // Divergence from specexec.py, deliberately. The reference also forces
+    // slot prefix_len (the subtree root's first child) to PROCESSED. That
+    // is right only when the subtree grew deep enough to decode it; at
+    // proactive_max_beam_len == 1 it would mark a node the draft engine
+    // never decoded as decoded, and acceptance would then skip the backfill
+    // that closes its KV gap. The kPost* remap above already carries the
+    // truthful status, so leave it alone.
+    status_[new_prefix_len] = kProcessed;
+
+    for (int32_t i = end_; i < max_len_; ++i) {
+        tokens_[i] = 0;
+        positions_[i] = 0;
+        parents_[i] = 0;
+        status_[i] = kPrompt;
+        logprobs_[i] = 0.0f;
+        seq_ids_[i] = 0;
+    }
+
+    // Rebuild the mask from parents rather than permuting the old one.
+    // Every node now sits at a higher slot than its parent, so one ascending
+    // pass of "parent's row plus my own bit" reproduces the causal prefix
+    // and the subtree's branch structure in a single rule.
+    std::fill(amask_.begin(), amask_.end(), uint8_t{0});
+    amask_[0] = 1;
+    for (int32_t i = 1; i < end_; ++i) {
+        std::memcpy(
+            amask_.data() + static_cast<size_t>(i) * max_len_,
+            amask_.data() + static_cast<size_t>(parents_[i]) * max_len_,
+            static_cast<size_t>(max_len_));
+        amask_[static_cast<size_t>(i) * max_len_ + i] = 1;
+    }
 }
 
 uint8_t Tree::amask_at(int32_t row, int32_t col) const {

@@ -72,6 +72,14 @@ struct ClientConfig {
     int32_t max_new_tokens = 64;
     int32_t client_idx = 0;
 
+    // Proactive draft (see proactive_draft.h). type is one of disabled,
+    // excluded, included; the rest are ignored when it is disabled.
+    std::string proactive_type = "disabled";
+    int32_t proactive_max_n_beams = 32;
+    int32_t proactive_max_beam_len = 2;
+    int32_t proactive_max_branch_width = 16;
+    int32_t proactive_max_budget = 32;
+
     // dataset selection (mirrors client.py's config fields); the dataset
     // file is always looked up under ./data.
     std::string dataset = "mtbench";
@@ -128,6 +136,20 @@ ClientConfig load_config(const std::string& path) {
     c.max_new_tokens = node_or<int32_t>(cl["max_new_tokens"], c.max_new_tokens);
     c.client_idx = node_or<int32_t>(cl["client_idx"], c.client_idx);
 
+    // Nested `proactive:` block, matching specedge.example.yaml's shape.
+    const YAML::Node pro = cl["proactive"];
+    if (pro && pro.IsMap()) {
+        c.proactive_type = node_or<std::string>(pro["type"], c.proactive_type);
+        c.proactive_max_n_beams =
+            node_or<int32_t>(pro["max_n_beams"], c.proactive_max_n_beams);
+        c.proactive_max_beam_len =
+            node_or<int32_t>(pro["max_beam_len"], c.proactive_max_beam_len);
+        c.proactive_max_branch_width =
+            node_or<int32_t>(pro["max_branch_width"], c.proactive_max_branch_width);
+        c.proactive_max_budget =
+            node_or<int32_t>(pro["max_budget"], c.proactive_max_budget);
+    }
+
     c.dataset = node_or<std::string>(cl["dataset"], c.dataset);
     c.reasoning = node_or<bool>(cl["reasoning"], c.reasoning);
     c.max_request_num = node_or<int32_t>(cl["max_request_num"], c.max_request_num);
@@ -147,6 +169,24 @@ ClientConfig load_config(const std::string& path) {
             "config: max_n_beams, max_beam_len, max_branch_width and "
             "max_budget must all be >= 1");
     }
+    // Throws on an unknown name; do it here so a typo fails at config load
+    // rather than after the model is on the GPU.
+    specedge::SpecExecClient::ParseProactiveType(c.proactive_type);
+    if (c.proactive_type != "disabled") {
+        if (c.proactive_max_n_beams < 1 || c.proactive_max_beam_len < 1 ||
+            c.proactive_max_branch_width < 1 || c.proactive_max_budget < 1) {
+            throw std::runtime_error(
+                "config: proactive max_n_beams, max_beam_len, max_branch_width and "
+                "max_budget must all be >= 1");
+        }
+        if (c.proactive_max_branch_width > c.max_branch_width) {
+            throw std::runtime_error(
+                "config: proactive.max_branch_width must be <= max_branch_width "
+                "(the draft engine's backend sampler is built once, at the wider "
+                "of the two, and a narrower proactive width reads as a prefix of "
+                "each row)");
+        }
+    }
     if (c.sample_req_cnt < 1) {
         throw std::runtime_error("config: dataset.sample_req_cnt must be >= 1");
     }
@@ -158,11 +198,19 @@ ClientConfig load_config(const std::string& path) {
 
 // Upper bound on llama.cpp sequences a round can fork: every draft step can
 // split each expanded beam into (width - 1) fresh branches, plus the
-// canonical seq 0. Clamped to llama.cpp's LLAMA_MAX_SEQ.
+// canonical seq 0. The proactive draft forks from the same pool inside the
+// same round -- and its branches stay live into the next one when the bet
+// wins -- so its own worst case is added on top. Clamped to llama.cpp's
+// LLAMA_MAX_SEQ.
 int32_t derive_max_seqs(const ClientConfig& cfg) {
-    const int64_t forks = 1 +
+    int64_t forks = 1 +
         static_cast<int64_t>(cfg.max_beam_len) * cfg.max_n_beams *
             (cfg.max_branch_width - 1);
+    if (cfg.proactive_type != "disabled") {
+        forks += 1 +  // the bonus token's own fork off the leaf it bets on
+            static_cast<int64_t>(cfg.proactive_max_beam_len) * cfg.proactive_max_n_beams *
+                (cfg.proactive_max_branch_width - 1);
+    }
     return static_cast<int32_t>(std::clamp<int64_t>(forks, 2, 256));
 }
 
@@ -487,6 +535,12 @@ int main(int argc, char** argv) {
             client_config.max_budget = cfg.max_budget;
             client_config.max_new_tokens = cfg.max_new_tokens;
             client_config.client_idx = cfg.client_idx;
+            client_config.proactive_type =
+                specedge::SpecExecClient::ParseProactiveType(cfg.proactive_type);
+            client_config.proactive.max_n_beams = cfg.proactive_max_n_beams;
+            client_config.proactive.max_beam_len = cfg.proactive_max_beam_len;
+            client_config.proactive.max_branch_width = cfg.proactive_max_branch_width;
+            client_config.proactive.max_budget = cfg.proactive_max_budget;
 
             specedge::SpecExecClient client(
                 engine, validator, prompt_tokens, prompt, client_config);

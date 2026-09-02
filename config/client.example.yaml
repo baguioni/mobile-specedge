@@ -13,6 +13,28 @@ client:
   max_branch_width: 16
   max_budget: 64
   max_seqs: null
+
+  # Proactive draft: while the Validate RPC is in flight, bet on the bonus
+  # token the target is about to return and pre-grow next round's tree from
+  # that bet. A hit splices the subtree in; a miss discards it.
+  #
+  #   type: disabled  no bet, no overlap (the pre-existing behaviour)
+  #         excluded  a hit deepens the tree; max_beam_len is left alone
+  #         included  a hit shortens the draft; max_beam_len drops by
+  #                   proactive.max_beam_len (so it must be strictly smaller)
+  #
+  # max_beam_len is the one to tune: the subtree costs roughly one draft
+  # level per unit, and only what fits inside target.client_wait is free.
+  # Read client_<idx>.jsonl's target.proactive (hit rate), proactive_ms
+  # (what it cost) and client_wait (what was available) and size it to fit.
+  # max_branch_width must be <= max_branch_width above.
+  proactive:
+    type: disabled
+    max_n_beams: 32
+    max_beam_len: 2
+    max_branch_width: 16
+    max_budget: 32
+
   max_new_tokens: 64
   client_idx: 0
   dataset: specbench

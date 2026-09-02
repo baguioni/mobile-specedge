@@ -570,6 +570,38 @@ void LlamaCppEngine::collapse_to_seq(int32_t seq_id, llama_pos last_pos) {
     predicted_.reset();
 }
 
+void LlamaCppEngine::collapse_to_seqs(
+    const std::vector<int32_t>& keep_seq_ids, int32_t new_seq_len) {
+    require_mode(/*tree=*/true, "collapse_to_seqs");
+    if (keep_seq_ids.empty()) {
+        throw std::invalid_argument("collapse_to_seqs: keep set is empty");
+    }
+
+    std::vector<uint8_t> keep(static_cast<size_t>(max_seqs_), 0);
+    for (int32_t s : keep_seq_ids) {
+        if (s < 0 || s >= max_seqs_) {
+            throw std::invalid_argument(
+                "collapse_to_seqs: seq_id " + std::to_string(s) +
+                " out of [0, max_seqs=" + std::to_string(max_seqs_) + ")");
+        }
+        keep[static_cast<size_t>(s)] = 1;
+    }
+
+    // No llama.cpp primitive keeps a *set* of sequences (seq_keep takes
+    // one), so drop the complement one tag at a time. A cell whose tag set
+    // empties is freed; a cell still tagged by a kept branch survives
+    // untouched, which is the whole point -- the surviving branches share
+    // the root..bonus path.
+    for (int32_t s = 0; s < max_seqs_; ++s) {
+        if (!keep[static_cast<size_t>(s)]) {
+            llama_memory_seq_rm(memory_, s, -1, -1);
+        }
+    }
+
+    seq_len_ = new_seq_len;
+    predicted_.reset();
+}
+
 void LlamaCppEngine::decode_token(llama_token token, llama_pos pos, int32_t seq_id) {
     require_mode(/*tree=*/true, "decode_token");
     if (seq_id < 0 || seq_id >= max_seqs_) {

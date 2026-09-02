@@ -10,6 +10,7 @@
 
 #include "graph_engine.h"
 #include "grpc_client.h"
+#include "proactive_draft.h"
 #include "tree.h"
 
 namespace specedge {
@@ -23,8 +24,6 @@ namespace specedge {
 // Differences from the Python version, by design:
 //  - No torch::Tensor / device work: Tree (tree.h) plus plain vectors and
 //    per-beam CPU loops for the log-softmax/top-k drafting math.
-//  - No proactive draft: SpecExecProactiveDraft has no port here (same
-//    stance as the former linear client; see linearspecexec.py's note).
 //  - Engine cache management is (seq, pos)-based, not slot-based. Python's
 //    engine.gather physically permutes torch cache rows; llama.cpp cells
 //    are immovable, so:
@@ -39,9 +38,19 @@ namespace specedge {
 //        node is a never-decoded CANDIDATE leaf, instead of a gather.
 //  - EOS uses llama_vocab_is_eog() instead of a single eos_token_id check,
 //    same as the former linear client.
-//  - No async/await: Validate() blocks synchronously.
+//  - No asyncio: the Validate RPC is moved to a std::async worker so the
+//    proactive draft can run against the engine while it is in flight. The
+//    worker touches nothing but its own copies of the request buffers --
+//    the engine and the tree stay with this thread.
 class SpecExecClient {
 public:
+    // Mirrors config.py's proactive_type. `included` charges the subtree's
+    // depth against the next round's draft budget (a hit shortens the
+    // draft); `excluded` leaves the budget alone (a hit deepens the tree).
+    enum class ProactiveType { kDisabled, kExcluded, kIncluded };
+
+    static ProactiveType ParseProactiveType(const std::string& name);
+
     struct Config {
         int32_t max_n_beams = 0;      // candidates expanded per draft step
         int32_t max_beam_len = 0;     // draft steps (max added depth) per round
@@ -49,6 +58,9 @@ public:
         int32_t max_budget = 0;       // draft-node budget per round
         int32_t max_new_tokens = 0;
         int32_t client_idx = 0;
+
+        ProactiveType proactive_type = ProactiveType::kDisabled;
+        ProactiveDraft::Config proactive;
     };
 
     // engine must be configured in tree mode (Config::max_seqs > 1). engine
@@ -84,10 +96,17 @@ private:
     // proactive-draft booleans.
     struct TargetStats {
         double preprocess_ms = 0.0;   // building the Validate request buffers
-        double wait_ms = 0.0;         // blocked on the Validate RPC
+        double wait_ms = 0.0;         // RPC in flight, proactive draft included
         double postprocess_ms = 0.0;  // acceptance + tree / KV fix-up
         int32_t prefill_cnt = 0;      // ValidateResponse.prefill for this batch
         int32_t num_accepted_tokens = 0;
+
+        // Proactive draft, all zero/false when it is disabled.
+        double proactive_ms = 0.0;    // spent inside ProactiveDraft::Draft()
+        bool proactive_ran = false;   // a bet was placed this round
+        bool proactive_hit = false;   // ...and the target agreed with it
+        bool prev_proactive_hit = false;  // the previous round's outcome
+        int32_t proactive_nodes = 0;  // subtree size, spliced or discarded
     };
 
     // Per-round draft-phase timings (milliseconds), one entry per tree
@@ -129,10 +148,17 @@ private:
     // Port of _check_new_token_in_budget.
     bool CheckNewTokenInBudget(const std::vector<float>& new_scores) const;
 
-    // Hands out fresh llama.cpp seq ids for branch forks. Never recycles
-    // mid-round (a pruned branch's cells may still be needed if its prefix
-    // is accepted); reset to 1 after every collapse.
+    // Hands out llama.cpp seq ids for branch forks, from the set no live
+    // tree node is using. Never recycles mid-round (a pruned branch's cells
+    // may still be needed if its prefix is accepted).
+    //
+    // A free list rather than a counter reset to 1, because a spliced
+    // proactive subtree carries its branches -- and their sequence ids --
+    // into the next round; those ids are still live and must not be handed
+    // out again. RebuildSeqPool() re-derives the free set from the tree
+    // after each acceptance.
     int32_t AllocSeq();
+    void RebuildSeqPool();
 
     // Appends one result record -- the same 11 fields the former linear
     // client ported from specexec.py's _cycle -- to
@@ -152,9 +178,18 @@ private:
 
     Tree tree_;
 
-    // Next fresh seq id for AllocSeq. Seq 0 is the canonical committed
-    // sequence; forks start at 1.
-    int32_t next_seq_ = 1;
+    // Null unless proactive_type != kDisabled.
+    std::unique_ptr<ProactiveDraft> proactive_;
+    // Whether the previous round's bet was spliced in. Drives `included`
+    // mode's draft-budget reduction, and is logged so a run can be scored
+    // on hit rate.
+    bool prev_proactive_hit_ = false;
+
+    // Free list backing AllocSeq: seq_in_use_[s] covers both live tree
+    // nodes and ids already handed out this round. Slot 0 is reserved for
+    // the canonical committed sequence and never handed out.
+    std::vector<uint8_t> seq_in_use_;
+    int32_t seq_cursor_ = 1;
 
     // Shared, process-wide result sink (same lifecycle as the former linear
     // client's): truncated the first time this process opens it, appended

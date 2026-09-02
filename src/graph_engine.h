@@ -136,6 +136,22 @@ public:
     // examples/speculative/speculative.cpp. Cells never move.
     void collapse_to_seq(int32_t seq_id, llama_pos last_pos);
 
+    // Tree mode only: end-of-round acceptance when a proactive subtree
+    // survives. Frees every cell not tagged by one of keep_seq_ids and
+    // leaves the survivors on the sequences they are already on.
+    //
+    // Two differences from collapse_to_seq, both required by the subtree:
+    // it keeps many branches rather than one, and it does not truncate by
+    // position -- the speculative nodes live *past* the committed prefix
+    // and are exactly what is being kept. Retagging onto seq 0 is likewise
+    // skipped, since the branches must stay distinguishable; the caller's
+    // slot -> seq map keeps naming them, and seq 0 simply tags nothing
+    // until the next non-proactive round.
+    //
+    // new_seq_len is the caller's post-collapse sequence length (the
+    // committed prefix), used to keep seq_len() meaningful.
+    void collapse_to_seqs(const std::vector<int32_t>& keep_seq_ids, int32_t new_seq_len);
+
     // Tree mode only: decodes one token without returning logits. Used to
     // backfill the deepest accepted node when it was a never-decoded
     // CANDIDATE leaf (the tree analogue of linear backfill()).
