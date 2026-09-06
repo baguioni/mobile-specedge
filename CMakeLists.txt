@@ -85,6 +85,13 @@ target_link_directories(graph_engine_lib PUBLIC ${GRPC_LIBRARY_DIRS})
 target_compile_options(graph_engine_lib PUBLIC ${GRPC_CFLAGS_OTHER})
 target_link_libraries(graph_engine_lib PUBLIC Threads::Threads llama nlohmann_json::nlohmann_json protobuf::libprotobuf ${GRPC_LIBRARIES})
 
+# Local smoke test: prefill a prompt, greedily decode a few tokens through
+# GraphEngine in linear mode, print the completion. No target server, no
+# gRPC round-trip -- just enough to prove the llama.cpp build links and that
+# prefill/forward/gather/reset round-trip on this machine (see src/local_test.cpp).
+add_executable(local_test src/local_test.cpp)
+target_link_libraries(local_test PRIVATE graph_engine_lib)
+
 # Config-driven batch client: reads a YAML config, walks a whole dataset,
 # runs each prompt through tree-based (SpecExec) speculative decoding. Port
 # of specedge/src/script/client.py.

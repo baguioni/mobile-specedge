@@ -27,7 +27,8 @@ anything here.
 | `src/tree.{h,cpp}` | `Tree` — the client-side draft tree (slots, positions, parents, attention mask). |
 | `src/spec_exec_client.{h,cpp}` | `SpecExecClient` — the draft + verify round loop (port of `specexec.py`). |
 | `src/proactive_draft.{h,cpp}` | `ProactiveDraft` — bets on the bonus token and pre-grows next round's tree inside the `Validate` round-trip (port of `proactive.py`). |
-| `src/script/client.cpp` | → `client` binary, the only executable. Config-driven batch run over a dataset. |
+| `src/script/client.cpp` | → `client` binary. Config-driven batch run over a dataset against a target server. |
+| `src/local_test.cpp` | → `local_test` binary. Offline smoke test: prefill one prompt, greedily decode a few tokens through `LlamaCppEngine` (linear mode), print the completion. No target server. |
 | `src/config.h` | Env-var config reader kept for parity with the Python launcher. **Not used by any current binary.** |
 | `src/metric/mobile.py` | Post-run latency/throughput analysis of the JSONL result logs. |
 | `src/test/` | Unit tests; build with `-DSPECEDGE_BUILD_TESTS=ON`. |
@@ -67,7 +68,9 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-The build produces a single binary: `build/client`.
+The build produces two binaries: `build/client` (the batch client) and
+`build/local_test` (an offline llama.cpp smoke test — see
+[`local_test`](#local_test--offline-smoke-test)).
 
 ### GPU / accelerator offload
 
@@ -165,6 +168,31 @@ The large model runs on the target server and is configured there, not here.
 ---
 
 ## Running
+
+### `local_test` — offline smoke test
+
+No target server, no gRPC. Loads a GGUF draft model into `LlamaCppEngine` in
+linear mode, prefills a prompt, greedily decodes a few tokens through
+`forward()`, exercises `gather()`/`reset()`, and prints the completion. Use it
+to confirm the llama.cpp build links and runs on this machine before wiring up
+a target.
+
+```sh
+./build/local_test --prompt "The capital of France is" --n-generate 12
+# Prompt: The capital of France is
+# Completion:  Paris, and the capital of Italy is Rome. The capital
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--model <path>` | GGUF model path (default `models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf`) |
+| `--prompt <text>` | prompt to complete (default `"The capital of France is"`) |
+| `--max-len <n>` | context / `max_len` passed to `LlamaCppEngine` (default 256) |
+| `--n-generate <n>` | tokens to greedily decode (default 8) |
+| `--n-gpu-layers <n>` | layers to offload to GPU, `-1` for all (default 0) |
+| `--n-threads <n>`, `--n-threads-batch <n>` | llama.cpp threading (default: llama.cpp's own) |
+
+Run from the project root so the default model path resolves.
 
 ### 1. Start a target server
 
