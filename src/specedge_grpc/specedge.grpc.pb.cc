@@ -25,6 +25,7 @@ namespace specedge {
 static const char* SpecEdgeService_method_names[] = {
   "/specedge.SpecEdgeService/Validate",
   "/specedge.SpecEdgeService/Sync",
+  "/specedge.SpecEdgeService/Done",
 };
 
 std::unique_ptr< SpecEdgeService::Stub> SpecEdgeService::NewStub(const std::shared_ptr< ::grpc::ChannelInterface>& channel, const ::grpc::StubOptions& options) {
@@ -36,6 +37,7 @@ std::unique_ptr< SpecEdgeService::Stub> SpecEdgeService::NewStub(const std::shar
 SpecEdgeService::Stub::Stub(const std::shared_ptr< ::grpc::ChannelInterface>& channel, const ::grpc::StubOptions& options)
   : channel_(channel), rpcmethod_Validate_(SpecEdgeService_method_names[0], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
   , rpcmethod_Sync_(SpecEdgeService_method_names[1], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_Done_(SpecEdgeService_method_names[2], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
   {}
 
 ::grpc::Status SpecEdgeService::Stub::Validate(::grpc::ClientContext* context, const ::specedge::ValidateRequest& request, ::specedge::ValidateResponse* response) {
@@ -84,6 +86,29 @@ void SpecEdgeService::Stub::async::Sync(::grpc::ClientContext* context, const ::
   return result;
 }
 
+::grpc::Status SpecEdgeService::Stub::Done(::grpc::ClientContext* context, const ::specedge::DoneRequest& request, ::specedge::DoneResponse* response) {
+  return ::grpc::internal::BlockingUnaryCall< ::specedge::DoneRequest, ::specedge::DoneResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(channel_.get(), rpcmethod_Done_, context, request, response);
+}
+
+void SpecEdgeService::Stub::async::Done(::grpc::ClientContext* context, const ::specedge::DoneRequest* request, ::specedge::DoneResponse* response, std::function<void(::grpc::Status)> f) {
+  ::grpc::internal::CallbackUnaryCall< ::specedge::DoneRequest, ::specedge::DoneResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(stub_->channel_.get(), stub_->rpcmethod_Done_, context, request, response, std::move(f));
+}
+
+void SpecEdgeService::Stub::async::Done(::grpc::ClientContext* context, const ::specedge::DoneRequest* request, ::specedge::DoneResponse* response, ::grpc::ClientUnaryReactor* reactor) {
+  ::grpc::internal::ClientCallbackUnaryFactory::Create< ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(stub_->channel_.get(), stub_->rpcmethod_Done_, context, request, response, reactor);
+}
+
+::grpc::ClientAsyncResponseReader< ::specedge::DoneResponse>* SpecEdgeService::Stub::PrepareAsyncDoneRaw(::grpc::ClientContext* context, const ::specedge::DoneRequest& request, ::grpc::CompletionQueue* cq) {
+  return ::grpc::internal::ClientAsyncResponseReaderHelper::Create< ::specedge::DoneResponse, ::specedge::DoneRequest, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(channel_.get(), cq, rpcmethod_Done_, context, request);
+}
+
+::grpc::ClientAsyncResponseReader< ::specedge::DoneResponse>* SpecEdgeService::Stub::AsyncDoneRaw(::grpc::ClientContext* context, const ::specedge::DoneRequest& request, ::grpc::CompletionQueue* cq) {
+  auto* result =
+    this->PrepareAsyncDoneRaw(context, request, cq);
+  result->StartCall();
+  return result;
+}
+
 SpecEdgeService::Service::Service() {
   AddMethod(new ::grpc::internal::RpcServiceMethod(
       SpecEdgeService_method_names[0],
@@ -105,6 +130,16 @@ SpecEdgeService::Service::Service() {
              ::specedge::SyncResponse* resp) {
                return service->Sync(ctx, req, resp);
              }, this)));
+  AddMethod(new ::grpc::internal::RpcServiceMethod(
+      SpecEdgeService_method_names[2],
+      ::grpc::internal::RpcMethod::NORMAL_RPC,
+      new ::grpc::internal::RpcMethodHandler< SpecEdgeService::Service, ::specedge::DoneRequest, ::specedge::DoneResponse, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
+          [](SpecEdgeService::Service* service,
+             ::grpc::ServerContext* ctx,
+             const ::specedge::DoneRequest* req,
+             ::specedge::DoneResponse* resp) {
+               return service->Done(ctx, req, resp);
+             }, this)));
 }
 
 SpecEdgeService::Service::~Service() {
@@ -118,6 +153,13 @@ SpecEdgeService::Service::~Service() {
 }
 
 ::grpc::Status SpecEdgeService::Service::Sync(::grpc::ServerContext* context, const ::specedge::SyncRequest* request, ::specedge::SyncResponse* response) {
+  (void) context;
+  (void) request;
+  (void) response;
+  return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+}
+
+::grpc::Status SpecEdgeService::Service::Done(::grpc::ServerContext* context, const ::specedge::DoneRequest* request, ::specedge::DoneResponse* response) {
   (void) context;
   (void) request;
   (void) response;

@@ -20,7 +20,7 @@ anything here.
 
 | Path | What it is |
 |------|------------|
-| `specedge.proto` | gRPC contract: `SpecEdgeService.Validate` / `.Sync`. |
+| `specedge.proto` | gRPC contract: `SpecEdgeService.Validate` / `.Sync` / `.Done`. Kept byte-identical to the Python `specedge` project's copy — that side owns it. |
 | `src/specedge_grpc/` | **Pre-generated** protobuf/gRPC C++ stubs, checked in. Regenerate only with a matching `protoc` / `grpc_cpp_plugin` (see below). |
 | `src/graph_engine.{h,cpp}` | `LlamaCppEngine` — wraps llama.cpp's KV cache. Linear mode (1 sequence) and tree mode (`kv_unified`, one sequence per draft branch). |
 | `src/grpc_client.{h,cpp}` | `GrpcClient` — synchronous client for the `Validate` RPC. |
@@ -149,6 +149,14 @@ protoc -I . \
 Then fix the includes if your protoc layout differs from the committed
 `#include "specedge_grpc/specedge.grpc.pb.h"` form.
 
+`specedge.proto` is a copy of the Python `specedge` project's file and that
+side owns it: when the contract moves there, copy it over and regenerate,
+rather than editing this copy. Editing it here without regenerating is worse
+than useless — the stubs keep the old contract while the `.proto` claims the
+new one, and nothing in the build catches the divergence. The stubs' own
+`#if PROTOBUF_VERSION != 7036000` guard pins the generating `protoc` to the
+runtime you link (36.0); see [Building](#building).
+
 ---
 
 ## Models
@@ -232,6 +240,7 @@ commented list. Key fields:
 | `proactive.max_n_beams`, `.max_beam_len`, `.max_branch_width`, `.max_budget` | subtree shape; `max_branch_width` must be `<=` the top-level one |
 | `max_new_tokens` | tokens generated per request |
 | `client_idx` | seeds the per-client request shuffle; names the output log |
+| `result_path`, `exp_name` | run outputs go to `<result_path>/<exp_name>/`; both empty ⇒ `./log` (see [Output logs](#output-logs)) |
 | `dataset` | one of `mtbench`, `c4`, `oasst`, `wikitext`, `specbench` |
 | `max_request_num` | `-1` = whole dataset, else absolute upper index |
 | `req_offset`, `sample_req_cnt` | start index, and take every Nth prompt |
@@ -266,7 +275,21 @@ setting is costing more than it returns.
 
 ## Output logs
 
-- **`log/client_<client_idx>.jsonl`** — one JSON record per draft+verify round
+Everything a run writes goes to one directory, named by two config fields that
+mirror the Python side's `base.result_path` / `base.exp_name`:
+
+```yaml
+client:
+  result_path: "result/mobile"
+  exp_name: "mobile"
+```
+
+With both set, the files below land in **`<result_path>/<exp_name>/`**; leave
+either empty (or omit it) and they fall back to `./log`, the previous
+behaviour. Paths are relative to the working directory, so run from the
+project root. The `client` binary prints the directory it chose on startup.
+
+- **`<log dir>/client_<client_idx>.jsonl`** — one JSON record per draft+verify round
   (timings, accepted-token counts). Written by `SpecExecClient`. Truncated on
   first open per process, appended thereafter. Per-round fields for bucketing a
   run the way `llama-bench`'s `-p` / `-d` sweeps do:
@@ -276,9 +299,12 @@ setting is costing more than it returns.
   | `context_len` | committed KV depth this round conditions on (prompt + all accepted so far) |
   | `prompt_len` | this request's prompt token count |
   | `draft.n_nodes` | draft tree size shipped to the target; `num_accepted_tokens / draft.n_nodes` is draft efficiency |
+- **`<log dir>/trace.txt`, `<log dir>/trace.jsonl`** — per-request prompt and
+  completion, for diffing two runs against each other.
 - **`graph-engine.log`** — per-forward debug log from `LlamaCppEngine`. Goes to
   the current directory, or to `$SPECEDGE_RESULT_PATH/$SPECEDGE_EXP_NAME/` when
-  both env vars are set.
+  both env vars are set — which is exactly what `client` exports from
+  `result_path` / `exp_name`, so it joins the rest of the run's files.
 
 ## Analyzing a run
 

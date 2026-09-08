@@ -16,13 +16,20 @@
 //    no configurable data directory.
 //  - No stub.Sync() handshake before the loop: GrpcClient exposes only
 //    Validate(); the first Validate() of each request carries prefill=true,
-//    which is what the server keys off.
+//    which is what the server keys off. The contract does define Sync and
+//    Done (specedge.proto), and Sync is how the Python client hands the
+//    server its exp_name / result_path so a persistent server re-points its
+//    own result logger at the run's folder. Since this client never calls
+//    it, `result_path` / `exp_name` below place *this process's* files only
+//    -- the server's server.jsonl still has to be copied in by hand before
+//    src/metric/mobile.py can read the pair.
 //  - Shuffle uses std::mt19937 seeded with client_idx, so the visiting
 //    order is deterministic per client but not bit-identical to CPython's
 //    random.shuffle().
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -71,6 +78,16 @@ struct ClientConfig {
     int32_t max_seqs = 0;  // llama.cpp sequences; 0 = derive from the above
     int32_t max_new_tokens = 64;
     int32_t client_idx = 0;
+
+    // Where a run's outputs go, mirroring the Python side's base.result_path
+    // / base.exp_name (config.py: "result_path/exp_name/process_name"). When
+    // both are set every output of this process -- client_<idx>.jsonl,
+    // trace.{txt,jsonl} and graph-engine.log -- is written to
+    // <result_path>/<exp_name>/ instead of ./log, so one run's files stay
+    // together and a server's server.jsonl can be dropped in beside them for
+    // src/metric/mobile.py. Leaving either empty keeps the ./log default.
+    std::string result_path;
+    std::string exp_name;
 
     // Proactive draft (see proactive_draft.h). type is one of disabled,
     // excluded, included; the rest are ignored when it is disabled.
@@ -135,6 +152,8 @@ ClientConfig load_config(const std::string& path) {
     c.max_seqs = node_or<int32_t>(cl["max_seqs"], c.max_seqs);
     c.max_new_tokens = node_or<int32_t>(cl["max_new_tokens"], c.max_new_tokens);
     c.client_idx = node_or<int32_t>(cl["client_idx"], c.client_idx);
+    c.result_path = node_or<std::string>(cl["result_path"], c.result_path);
+    c.exp_name = node_or<std::string>(cl["exp_name"], c.exp_name);
 
     // Nested `proactive:` block, matching specedge.example.yaml's shape.
     const YAML::Node pro = cl["proactive"];
@@ -194,6 +213,19 @@ ClientConfig load_config(const std::string& path) {
         throw std::runtime_error("config: dataset.max_request_num must be -1 or >= 0");
     }
     return c;
+}
+
+// Every output of a run goes in one directory: <result_path>/<exp_name> when
+// the config names both, matching config.py's "result_path/exp_name" layout,
+// otherwise the repo-relative ./log the client has always used. Requiring
+// both is deliberate -- half of the pair would silently write a run into
+// ./<exp_name> or <result_path>/, neither of which is what the Python
+// launcher produces, and the metric scripts read a whole directory.
+std::string resolve_log_dir(const ClientConfig& cfg) {
+    if (cfg.result_path.empty() || cfg.exp_name.empty()) {
+        return "log";
+    }
+    return (std::filesystem::path(cfg.result_path) / cfg.exp_name).string();
 }
 
 // Upper bound on llama.cpp sequences a round can fork: every draft step can
@@ -475,6 +507,18 @@ int main(int argc, char** argv) {
     try {
         const ClientConfig cfg = load_config(config_path);
 
+        // <result_path>/<exp_name> when both are set, else ./log. Exported
+        // before the engine is built because LlamaCppEngine resolves
+        // graph-engine.log's directory from these two env vars in its
+        // constructor -- the same handoff batch_server.py makes on the
+        // Python side (os.environ["SPECEDGE_RESULT_PATH"] = result_path).
+        const std::string log_dir = resolve_log_dir(cfg);
+        if (!cfg.result_path.empty() && !cfg.exp_name.empty()) {
+            ::setenv("SPECEDGE_RESULT_PATH", cfg.result_path.c_str(), /*overwrite=*/1);
+            ::setenv("SPECEDGE_EXP_NAME", cfg.exp_name.c_str(), /*overwrite=*/1);
+        }
+        std::fprintf(stderr, "Writing results to %s/\n", log_dir.c_str());
+
         specedge::LlamaCppEngine::Config engine_config;
         engine_config.model_path = cfg.draft_model;
         engine_config.max_len = cfg.max_len;
@@ -505,7 +549,7 @@ int main(int argc, char** argv) {
         const std::vector<int32_t> req_indices =
             build_request_indices(static_cast<int32_t>(dataset.size()), cfg);
 
-        TraceWriter trace("log");
+        TraceWriter trace(log_dir);
 
         std::fprintf(stderr,
             "Loaded dataset '%s' (%zu prompts); running %zu requests against %s\n",
@@ -535,6 +579,7 @@ int main(int argc, char** argv) {
             client_config.max_budget = cfg.max_budget;
             client_config.max_new_tokens = cfg.max_new_tokens;
             client_config.client_idx = cfg.client_idx;
+            client_config.log_dir = log_dir;
             client_config.proactive_type =
                 specedge::SpecExecClient::ParseProactiveType(cfg.proactive_type);
             client_config.proactive.max_n_beams = cfg.proactive_max_n_beams;

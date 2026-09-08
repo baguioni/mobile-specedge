@@ -58,6 +58,10 @@ public:
         int32_t max_budget = 0;       // draft-node budget per round
         int32_t max_new_tokens = 0;
         int32_t client_idx = 0;
+        // Directory client_<idx>.jsonl is written to, created on first use.
+        // The launcher points this at <result_path>/<exp_name> when both are
+        // configured; "log" is the repo-relative default.
+        std::string log_dir = "log";
 
         ProactiveType proactive_type = ProactiveType::kDisabled;
         ProactiveDraft::Config proactive;

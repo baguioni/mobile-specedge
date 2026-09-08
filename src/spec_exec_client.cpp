@@ -67,18 +67,22 @@ std::string Iso8601Now() {
     return std::string(buf);
 }
 
-// Result files live under ./log (created on first use), one per client
-// index: log/client_<idx>.jsonl -- the client_*.jsonl name
-// metric/specedge.py globs for. The stream is truncated the first time
+// Result files live under Config::log_dir (created on first use, ./log by
+// default), one per client index: <log_dir>/client_<idx>.jsonl -- the
+// client_*.jsonl name metric/specedge.py globs for. Config::log_dir is
+// <result_path>/<exp_name> when the launcher was given both, mirroring
+// config.py's "result_path/exp_name/process_name" layout so a run's client
+// logs land next to the server's. The stream is truncated the first time
 // this process opens a given path and shared (append) by every client
 // afterwards, matching log.py's ResultHandler opening "w" once while the
 // QueueListener appends each record.
 std::mutex g_result_log_mutex;
 std::unordered_map<std::string, std::shared_ptr<std::ofstream>> g_result_logs;
 
-std::shared_ptr<std::ofstream> GetResultLog(int32_t client_idx) {
+std::shared_ptr<std::ofstream> GetResultLog(
+    int32_t client_idx, const std::string& log_dir_name) {
     namespace fs = std::filesystem;
-    fs::path log_dir = "log";
+    fs::path log_dir = log_dir_name.empty() ? fs::path("log") : fs::path(log_dir_name);
     fs::create_directories(log_dir);
     fs::path path = log_dir / ("client_" + std::to_string(client_idx) + ".jsonl");
 
@@ -144,7 +148,7 @@ SpecExecClient::SpecExecClient(
       config_(config),
       tree_(std::move(prompt_tokens), engine.max_len()),
       prompt_len_(tree_.prefix_len()),
-      result_log_(GetResultLog(config.client_idx)) {
+      result_log_(GetResultLog(config.client_idx, config.log_dir)) {
     if (!engine_.tree_mode()) {
         throw std::invalid_argument(
             "SpecExecClient requires an engine in tree mode "

@@ -50,6 +50,13 @@ class SpecEdgeService final {
     std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::specedge::SyncResponse>> PrepareAsyncSync(::grpc::ClientContext* context, const ::specedge::SyncRequest& request, ::grpc::CompletionQueue* cq) {
       return std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::specedge::SyncResponse>>(PrepareAsyncSyncRaw(context, request, cq));
     }
+    virtual ::grpc::Status Done(::grpc::ClientContext* context, const ::specedge::DoneRequest& request, ::specedge::DoneResponse* response) = 0;
+    std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::specedge::DoneResponse>> AsyncDone(::grpc::ClientContext* context, const ::specedge::DoneRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::specedge::DoneResponse>>(AsyncDoneRaw(context, request, cq));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::specedge::DoneResponse>> PrepareAsyncDone(::grpc::ClientContext* context, const ::specedge::DoneRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::specedge::DoneResponse>>(PrepareAsyncDoneRaw(context, request, cq));
+    }
     class async_interface {
      public:
       virtual ~async_interface() {}
@@ -57,6 +64,8 @@ class SpecEdgeService final {
       virtual void Validate(::grpc::ClientContext* context, const ::specedge::ValidateRequest* request, ::specedge::ValidateResponse* response, ::grpc::ClientUnaryReactor* reactor) = 0;
       virtual void Sync(::grpc::ClientContext* context, const ::specedge::SyncRequest* request, ::specedge::SyncResponse* response, std::function<void(::grpc::Status)>) = 0;
       virtual void Sync(::grpc::ClientContext* context, const ::specedge::SyncRequest* request, ::specedge::SyncResponse* response, ::grpc::ClientUnaryReactor* reactor) = 0;
+      virtual void Done(::grpc::ClientContext* context, const ::specedge::DoneRequest* request, ::specedge::DoneResponse* response, std::function<void(::grpc::Status)>) = 0;
+      virtual void Done(::grpc::ClientContext* context, const ::specedge::DoneRequest* request, ::specedge::DoneResponse* response, ::grpc::ClientUnaryReactor* reactor) = 0;
     };
     typedef class async_interface experimental_async_interface;
     virtual class async_interface* async() { return nullptr; }
@@ -66,6 +75,8 @@ class SpecEdgeService final {
     virtual ::grpc::ClientAsyncResponseReaderInterface< ::specedge::ValidateResponse>* PrepareAsyncValidateRaw(::grpc::ClientContext* context, const ::specedge::ValidateRequest& request, ::grpc::CompletionQueue* cq) = 0;
     virtual ::grpc::ClientAsyncResponseReaderInterface< ::specedge::SyncResponse>* AsyncSyncRaw(::grpc::ClientContext* context, const ::specedge::SyncRequest& request, ::grpc::CompletionQueue* cq) = 0;
     virtual ::grpc::ClientAsyncResponseReaderInterface< ::specedge::SyncResponse>* PrepareAsyncSyncRaw(::grpc::ClientContext* context, const ::specedge::SyncRequest& request, ::grpc::CompletionQueue* cq) = 0;
+    virtual ::grpc::ClientAsyncResponseReaderInterface< ::specedge::DoneResponse>* AsyncDoneRaw(::grpc::ClientContext* context, const ::specedge::DoneRequest& request, ::grpc::CompletionQueue* cq) = 0;
+    virtual ::grpc::ClientAsyncResponseReaderInterface< ::specedge::DoneResponse>* PrepareAsyncDoneRaw(::grpc::ClientContext* context, const ::specedge::DoneRequest& request, ::grpc::CompletionQueue* cq) = 0;
   };
   class Stub final : public StubInterface {
    public:
@@ -84,6 +95,13 @@ class SpecEdgeService final {
     std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::specedge::SyncResponse>> PrepareAsyncSync(::grpc::ClientContext* context, const ::specedge::SyncRequest& request, ::grpc::CompletionQueue* cq) {
       return std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::specedge::SyncResponse>>(PrepareAsyncSyncRaw(context, request, cq));
     }
+    ::grpc::Status Done(::grpc::ClientContext* context, const ::specedge::DoneRequest& request, ::specedge::DoneResponse* response) override;
+    std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::specedge::DoneResponse>> AsyncDone(::grpc::ClientContext* context, const ::specedge::DoneRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::specedge::DoneResponse>>(AsyncDoneRaw(context, request, cq));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::specedge::DoneResponse>> PrepareAsyncDone(::grpc::ClientContext* context, const ::specedge::DoneRequest& request, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::specedge::DoneResponse>>(PrepareAsyncDoneRaw(context, request, cq));
+    }
     class async final :
       public StubInterface::async_interface {
      public:
@@ -91,6 +109,8 @@ class SpecEdgeService final {
       void Validate(::grpc::ClientContext* context, const ::specedge::ValidateRequest* request, ::specedge::ValidateResponse* response, ::grpc::ClientUnaryReactor* reactor) override;
       void Sync(::grpc::ClientContext* context, const ::specedge::SyncRequest* request, ::specedge::SyncResponse* response, std::function<void(::grpc::Status)>) override;
       void Sync(::grpc::ClientContext* context, const ::specedge::SyncRequest* request, ::specedge::SyncResponse* response, ::grpc::ClientUnaryReactor* reactor) override;
+      void Done(::grpc::ClientContext* context, const ::specedge::DoneRequest* request, ::specedge::DoneResponse* response, std::function<void(::grpc::Status)>) override;
+      void Done(::grpc::ClientContext* context, const ::specedge::DoneRequest* request, ::specedge::DoneResponse* response, ::grpc::ClientUnaryReactor* reactor) override;
      private:
       friend class Stub;
       explicit async(Stub* stub): stub_(stub) { }
@@ -106,8 +126,11 @@ class SpecEdgeService final {
     ::grpc::ClientAsyncResponseReader< ::specedge::ValidateResponse>* PrepareAsyncValidateRaw(::grpc::ClientContext* context, const ::specedge::ValidateRequest& request, ::grpc::CompletionQueue* cq) override;
     ::grpc::ClientAsyncResponseReader< ::specedge::SyncResponse>* AsyncSyncRaw(::grpc::ClientContext* context, const ::specedge::SyncRequest& request, ::grpc::CompletionQueue* cq) override;
     ::grpc::ClientAsyncResponseReader< ::specedge::SyncResponse>* PrepareAsyncSyncRaw(::grpc::ClientContext* context, const ::specedge::SyncRequest& request, ::grpc::CompletionQueue* cq) override;
+    ::grpc::ClientAsyncResponseReader< ::specedge::DoneResponse>* AsyncDoneRaw(::grpc::ClientContext* context, const ::specedge::DoneRequest& request, ::grpc::CompletionQueue* cq) override;
+    ::grpc::ClientAsyncResponseReader< ::specedge::DoneResponse>* PrepareAsyncDoneRaw(::grpc::ClientContext* context, const ::specedge::DoneRequest& request, ::grpc::CompletionQueue* cq) override;
     const ::grpc::internal::RpcMethod rpcmethod_Validate_;
     const ::grpc::internal::RpcMethod rpcmethod_Sync_;
+    const ::grpc::internal::RpcMethod rpcmethod_Done_;
   };
   static std::unique_ptr<Stub> NewStub(const std::shared_ptr< ::grpc::ChannelInterface>& channel, const ::grpc::StubOptions& options = ::grpc::StubOptions());
 
@@ -117,6 +140,7 @@ class SpecEdgeService final {
     virtual ~Service();
     virtual ::grpc::Status Validate(::grpc::ServerContext* context, const ::specedge::ValidateRequest* request, ::specedge::ValidateResponse* response);
     virtual ::grpc::Status Sync(::grpc::ServerContext* context, const ::specedge::SyncRequest* request, ::specedge::SyncResponse* response);
+    virtual ::grpc::Status Done(::grpc::ServerContext* context, const ::specedge::DoneRequest* request, ::specedge::DoneResponse* response);
   };
   template <class BaseClass>
   class WithAsyncMethod_Validate : public BaseClass {
@@ -158,7 +182,27 @@ class SpecEdgeService final {
       ::grpc::Service::RequestAsyncUnary(1, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
-  typedef WithAsyncMethod_Validate<WithAsyncMethod_Sync<Service > > AsyncService;
+  template <class BaseClass>
+  class WithAsyncMethod_Done : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithAsyncMethod_Done() {
+      ::grpc::Service::MarkMethodAsync(2);
+    }
+    ~WithAsyncMethod_Done() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status Done(::grpc::ServerContext* /*context*/, const ::specedge::DoneRequest* /*request*/, ::specedge::DoneResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestDone(::grpc::ServerContext* context, ::specedge::DoneRequest* request, ::grpc::ServerAsyncResponseWriter< ::specedge::DoneResponse>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncUnary(2, context, request, response, new_call_cq, notification_cq, tag);
+    }
+  };
+  typedef WithAsyncMethod_Validate<WithAsyncMethod_Sync<WithAsyncMethod_Done<Service > > > AsyncService;
   template <class BaseClass>
   class WithCallbackMethod_Validate : public BaseClass {
    private:
@@ -213,7 +257,34 @@ class SpecEdgeService final {
     virtual ::grpc::ServerUnaryReactor* Sync(
       ::grpc::CallbackServerContext* /*context*/, const ::specedge::SyncRequest* /*request*/, ::specedge::SyncResponse* /*response*/)  { return nullptr; }
   };
-  typedef WithCallbackMethod_Validate<WithCallbackMethod_Sync<Service > > CallbackService;
+  template <class BaseClass>
+  class WithCallbackMethod_Done : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithCallbackMethod_Done() {
+      ::grpc::Service::MarkMethodCallback(2,
+          new ::grpc::internal::CallbackUnaryHandler< ::specedge::DoneRequest, ::specedge::DoneResponse>(
+            [this](
+                   ::grpc::CallbackServerContext* context, const ::specedge::DoneRequest* request, ::specedge::DoneResponse* response) { return this->Done(context, request, response); }));}
+    void SetMessageAllocatorFor_Done(
+        ::grpc::MessageAllocator< ::specedge::DoneRequest, ::specedge::DoneResponse>* allocator) {
+      ::grpc::internal::MethodHandler* const handler = ::grpc::Service::GetHandler(2);
+      static_cast<::grpc::internal::CallbackUnaryHandler< ::specedge::DoneRequest, ::specedge::DoneResponse>*>(handler)
+              ->SetMessageAllocator(allocator);
+    }
+    ~WithCallbackMethod_Done() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status Done(::grpc::ServerContext* /*context*/, const ::specedge::DoneRequest* /*request*/, ::specedge::DoneResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerUnaryReactor* Done(
+      ::grpc::CallbackServerContext* /*context*/, const ::specedge::DoneRequest* /*request*/, ::specedge::DoneResponse* /*response*/)  { return nullptr; }
+  };
+  typedef WithCallbackMethod_Validate<WithCallbackMethod_Sync<WithCallbackMethod_Done<Service > > > CallbackService;
   typedef CallbackService ExperimentalCallbackService;
   template <class BaseClass>
   class WithGenericMethod_Validate : public BaseClass {
@@ -245,6 +316,23 @@ class SpecEdgeService final {
     }
     // disable synchronous version of this method
     ::grpc::Status Sync(::grpc::ServerContext* /*context*/, const ::specedge::SyncRequest* /*request*/, ::specedge::SyncResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+  };
+  template <class BaseClass>
+  class WithGenericMethod_Done : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithGenericMethod_Done() {
+      ::grpc::Service::MarkMethodGeneric(2);
+    }
+    ~WithGenericMethod_Done() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status Done(::grpc::ServerContext* /*context*/, const ::specedge::DoneRequest* /*request*/, ::specedge::DoneResponse* /*response*/) override {
       abort();
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
@@ -290,6 +378,26 @@ class SpecEdgeService final {
     }
   };
   template <class BaseClass>
+  class WithRawMethod_Done : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawMethod_Done() {
+      ::grpc::Service::MarkMethodRaw(2);
+    }
+    ~WithRawMethod_Done() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status Done(::grpc::ServerContext* /*context*/, const ::specedge::DoneRequest* /*request*/, ::specedge::DoneResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestDone(::grpc::ServerContext* context, ::grpc::ByteBuffer* request, ::grpc::ServerAsyncResponseWriter< ::grpc::ByteBuffer>* response, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncUnary(2, context, request, response, new_call_cq, notification_cq, tag);
+    }
+  };
+  template <class BaseClass>
   class WithRawCallbackMethod_Validate : public BaseClass {
    private:
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
@@ -331,6 +439,28 @@ class SpecEdgeService final {
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
     virtual ::grpc::ServerUnaryReactor* Sync(
+      ::grpc::CallbackServerContext* /*context*/, const ::grpc::ByteBuffer* /*request*/, ::grpc::ByteBuffer* /*response*/)  { return nullptr; }
+  };
+  template <class BaseClass>
+  class WithRawCallbackMethod_Done : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawCallbackMethod_Done() {
+      ::grpc::Service::MarkMethodRawCallback(2,
+          new ::grpc::internal::CallbackUnaryHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
+            [this](
+                   ::grpc::CallbackServerContext* context, const ::grpc::ByteBuffer* request, ::grpc::ByteBuffer* response) { return this->Done(context, request, response); }));
+    }
+    ~WithRawCallbackMethod_Done() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status Done(::grpc::ServerContext* /*context*/, const ::specedge::DoneRequest* /*request*/, ::specedge::DoneResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerUnaryReactor* Done(
       ::grpc::CallbackServerContext* /*context*/, const ::grpc::ByteBuffer* /*request*/, ::grpc::ByteBuffer* /*response*/)  { return nullptr; }
   };
   template <class BaseClass>
@@ -387,9 +517,36 @@ class SpecEdgeService final {
     // replace default version of method with streamed unary
     virtual ::grpc::Status StreamedSync(::grpc::ServerContext* context, ::grpc::ServerUnaryStreamer< ::specedge::SyncRequest,::specedge::SyncResponse>* server_unary_streamer) = 0;
   };
-  typedef WithStreamedUnaryMethod_Validate<WithStreamedUnaryMethod_Sync<Service > > StreamedUnaryService;
+  template <class BaseClass>
+  class WithStreamedUnaryMethod_Done : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithStreamedUnaryMethod_Done() {
+      ::grpc::Service::MarkMethodStreamed(2,
+        new ::grpc::internal::StreamedUnaryHandler<
+          ::specedge::DoneRequest, ::specedge::DoneResponse>(
+            [this](::grpc::ServerContext* context,
+                   ::grpc::ServerUnaryStreamer<
+                     ::specedge::DoneRequest, ::specedge::DoneResponse>* streamer) {
+                       return this->StreamedDone(context,
+                         streamer);
+                  }));
+    }
+    ~WithStreamedUnaryMethod_Done() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable regular version of this method
+    ::grpc::Status Done(::grpc::ServerContext* /*context*/, const ::specedge::DoneRequest* /*request*/, ::specedge::DoneResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    // replace default version of method with streamed unary
+    virtual ::grpc::Status StreamedDone(::grpc::ServerContext* context, ::grpc::ServerUnaryStreamer< ::specedge::DoneRequest,::specedge::DoneResponse>* server_unary_streamer) = 0;
+  };
+  typedef WithStreamedUnaryMethod_Validate<WithStreamedUnaryMethod_Sync<WithStreamedUnaryMethod_Done<Service > > > StreamedUnaryService;
   typedef Service SplitStreamedService;
-  typedef WithStreamedUnaryMethod_Validate<WithStreamedUnaryMethod_Sync<Service > > StreamedService;
+  typedef WithStreamedUnaryMethod_Validate<WithStreamedUnaryMethod_Sync<WithStreamedUnaryMethod_Done<Service > > > StreamedService;
 };
 
 }  // namespace specedge
