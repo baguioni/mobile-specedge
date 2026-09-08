@@ -268,7 +268,14 @@ setting is costing more than it returns.
 
 - **`log/client_<client_idx>.jsonl`** — one JSON record per draft+verify round
   (timings, accepted-token counts). Written by `SpecExecClient`. Truncated on
-  first open per process, appended thereafter.
+  first open per process, appended thereafter. Per-round fields for bucketing a
+  run the way `llama-bench`'s `-p` / `-d` sweeps do:
+
+  | field | |
+  |---|---|
+  | `context_len` | committed KV depth this round conditions on (prompt + all accepted so far) |
+  | `prompt_len` | this request's prompt token count |
+  | `draft.n_nodes` | draft tree size shipped to the target; `num_accepted_tokens / draft.n_nodes` is draft efficiency |
 - **`graph-engine.log`** — per-forward debug log from `LlamaCppEngine`. Goes to
   the current directory, or to `$SPECEDGE_RESULT_PATH/$SPECEDGE_EXP_NAME/` when
   both env vars are set.

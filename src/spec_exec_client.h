@@ -100,6 +100,11 @@ private:
         double postprocess_ms = 0.0;  // acceptance + tree / KV fix-up
         int32_t prefill_cnt = 0;      // ValidateResponse.prefill for this batch
         int32_t num_accepted_tokens = 0;
+        // Draft nodes shipped to the target this round (target_indices in
+        // ValidateTree: every decoded node plus the last level's CANDIDATE
+        // leaves, prefix and proactive subtree excluded). Pairs with
+        // num_accepted_tokens as draft efficiency = accepted / drafted.
+        int32_t num_draft_nodes = 0;
 
         // Proactive draft, all zero/false when it is disabled.
         double proactive_ms = 0.0;    // spent inside ProactiveDraft::Draft()
@@ -160,12 +165,15 @@ private:
     int32_t AllocSeq();
     void RebuildSeqPool();
 
-    // Appends one result record -- the same 11 fields the former linear
-    // client ported from specexec.py's _cycle -- to
-    // log/client_<client_idx>.jsonl.
+    // Appends one result record to log/client_<client_idx>.jsonl: the
+    // fields the former linear client ported from specexec.py's _cycle,
+    // plus context_len / prompt_len / draft.n_nodes (KV depth, prompt
+    // length, and drafted tree size, for bucketing a run the way
+    // llama-bench's -d sweep does).
     void LogCycle(
         int32_t req_idx,
         int32_t step_idx,
+        int32_t context_len,
         const DraftStats& draft_stats,
         double draft_end_to_end_ms,
         const TargetStats& stats,
@@ -177,6 +185,12 @@ private:
     Config config_;
 
     Tree tree_;
+
+    // Prompt token count for this request: tree_.prefix_len() at
+    // construction, before any round has run. Logged on every cycle so a
+    // run can be bucketed by prompt / prefill length. Declared after tree_
+    // so the member initializer below reads a constructed tree_.
+    int32_t prompt_len_ = 0;
 
     // Null unless proactive_type != kDisabled.
     std::unique_ptr<ProactiveDraft> proactive_;

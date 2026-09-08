@@ -143,6 +143,7 @@ SpecExecClient::SpecExecClient(
       prompt_text_(std::move(prompt_text)),
       config_(config),
       tree_(std::move(prompt_tokens), engine.max_len()),
+      prompt_len_(tree_.prefix_len()),
       result_log_(GetResultLog(config.client_idx)) {
     if (!engine_.tree_mode()) {
         throw std::invalid_argument(
@@ -282,6 +283,12 @@ std::vector<llama_token> SpecExecClient::Generate(int32_t req_idx, GenerateTrace
 }
 
 std::vector<llama_token> SpecExecClient::RunCycle(int32_t req_idx, int32_t step_idx, bool prefill) {
+    // Committed context this round conditions on -- prompt plus every token
+    // accepted so far (between rounds tree_.prefix_len() == tree_.end()).
+    // Captured before GrowTree touches the tree so a run can be bucketed by
+    // KV depth the way llama-bench's -d sweep is.
+    const int32_t context_len = tree_.prefix_len();
+
     // Draft phase: specexec.py wraps _grow_tree in util.Timing("sync").
     DraftStats draft_stats;
     SteadyClock::time_point draft_start = SteadyClock::now();
@@ -295,7 +302,8 @@ std::vector<llama_token> SpecExecClient::RunCycle(int32_t req_idx, int32_t step_
     double target_end_to_end_ms = MillisSince(target_start);
 
     LogCycle(
-        req_idx, step_idx, draft_stats, draft_end_to_end_ms, stats, target_end_to_end_ms);
+        req_idx, step_idx, context_len, draft_stats, draft_end_to_end_ms, stats,
+        target_end_to_end_ms);
 
     return fresh_tokens;
 }
@@ -600,6 +608,7 @@ std::vector<llama_token> SpecExecClient::ValidateTree(
         throw std::runtime_error(
             "SpecExecClient: no draft nodes to validate; the tree failed to grow.");
     }
+    stats.num_draft_nodes = static_cast<int32_t>(target_indices.size());
     std::vector<int32_t> target_parents;
     target_parents.reserve(target_indices.size());
     for (int32_t t : target_indices) {
@@ -847,6 +856,7 @@ std::vector<llama_token> SpecExecClient::ValidateTree(
 void SpecExecClient::LogCycle(
     int32_t req_idx,
     int32_t step_idx,
+    int32_t context_len,
     const DraftStats& draft_stats,
     double draft_end_to_end_ms,
     const TargetStats& stats,
@@ -860,6 +870,11 @@ void SpecExecClient::LogCycle(
     entry["client_idx"] = config_.client_idx;
     entry["req_idx"] = req_idx;
     entry["step_idx"] = step_idx;
+    // KV depth this round conditions on, and the request's prompt length,
+    // so results can be bucketed by context depth / prefill size the way
+    // llama-bench uses -d / -p.
+    entry["context_len"] = context_len;
+    entry["prompt_len"] = prompt_len_;
     entry["draft"]["forward"] = draft_stats.forward_ms;
     entry["draft"]["fork"] = draft_stats.fork_ms;
     entry["draft"]["n_beams"] = draft_stats.n_beams;
@@ -873,6 +888,10 @@ void SpecExecClient::LogCycle(
     };
     entry["draft"]["residual"] =
         draft_end_to_end_ms - sum(draft_stats.forward_ms) - sum(draft_stats.fork_ms);
+    // Tree size actually shipped to the target. draft.n_beams holds the
+    // per-level widths; this is their post-TrimByBudget total, and
+    // num_accepted_tokens / draft.n_nodes is the round's draft efficiency.
+    entry["draft"]["n_nodes"] = stats.num_draft_nodes;
     entry["target"]["client_preprocess"] = stats.preprocess_ms;
     entry["target"]["client_wait"] = stats.wait_ms;
     entry["target"]["client_postprocess"] = stats.postprocess_ms;
