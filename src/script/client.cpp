@@ -555,6 +555,13 @@ int main(int argc, char** argv) {
             "Loaded dataset '%s' (%zu prompts); running %zu requests against %s\n",
             cfg.dataset.c_str(), dataset.size(), req_indices.size(), cfg.host.c_str());
 
+        // Hand the server this run's identity before the first Validate, the
+        // way client.py does. A persistent server re-points its own result
+        // logger at <result_path>/<exp_name> and drops the previous run's KV
+        // state; skip it and two back-to-back experiments both land in
+        // whatever folder the server was started with.
+        validator.Sync(cfg.client_idx, cfg.exp_name, cfg.result_path);
+
         for (size_t k = 0; k < req_indices.size(); ++k) {
             const int32_t req_idx = req_indices[k];
             const std::string& prompt = dataset[static_cast<size_t>(req_idx)];
@@ -618,6 +625,14 @@ int main(int argc, char** argv) {
         }
 
         trace.Close();
+
+        // Best-effort, like client.py's: every result is already on disk by
+        // now, so a server that has gone away is worth a warning and nothing
+        // more. shutdown stays false -- tripping the server's teardown is the
+        // sweep orchestrator's job, not a single run's.
+        if (!validator.Done(cfg.client_idx)) {
+            std::fprintf(stderr, "warning: Done notification failed\n");
+        }
         return 0;
     } catch (const std::exception& e) {
         // Model load, YAML parse, the gRPC channel (target unreachable), or

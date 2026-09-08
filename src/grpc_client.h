@@ -92,6 +92,32 @@ public:
         bool prefill = false,
         std::optional<std::string> prefix = std::nullopt);
 
+    // Experiment handshake, mirroring client.py's stub.Sync() before the
+    // request loop. exp_name / result_path travel with it so a *persistent*
+    // server re-points its own result logger at this run's folder -- without
+    // it the server keeps writing every experiment into whatever folder it
+    // was started with, and back-to-back runs land on top of each other.
+    //
+    // Blocks until the server has heard from all SPECEDGE_NUM_CLIENTS
+    // clients: grpc.py's Sync is a barrier, and only the last arrival
+    // triggers the server's begin_experiment (re-point the logger, drop the
+    // previous run's KV state). With num_clients = 1 it returns immediately.
+    // Throws std::runtime_error if the RPC fails.
+    void Sync(
+        int32_t client_idx,
+        const std::string& exp_name,
+        const std::string& result_path);
+
+    // Marks this client finished, mirroring client.py's stub.Done(). The
+    // server counts it and re-arms for the next experiment's Sync.
+    //
+    // shutdown is the sweep orchestrator's flag, not a normal client's: it
+    // trips the server's graceful shutdown, so a plain run must leave it
+    // false or the next experiment has no server to talk to. Returns false
+    // instead of throwing when the RPC fails -- the run's results are
+    // already written by this point, which is why client.py only warns.
+    bool Done(int32_t client_idx, bool shutdown = false);
+
 private:
     std::shared_ptr<grpc::Channel> channel_;
     std::unique_ptr<SpecEdgeService::Stub> stub_;

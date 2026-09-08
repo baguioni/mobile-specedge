@@ -78,6 +78,10 @@ llama.cpp backend options pass straight through at configure time, e.g.
 `-DGGML_METAL=ON` (Apple), `-DGGML_CUDA=ON`, `-DGGML_VULKAN=ON`. At run time set
 `n_gpu_layers` in the YAML config: `-1` offloads all layers, `0` is CPU-only.
 
+Two backends have their own sections below, since both need more than the one
+flag: [CUDA](#cuda-build) for an NVIDIA edge box, and
+[OpenCL](#android-build-opencl--adreno-gpu) for a Snapdragon phone's Adreno GPU.
+
 ### CUDA build
 
 Builds the bundled llama.cpp (`b10615`) with its CUDA backend so the draft
@@ -156,6 +160,110 @@ than useless — the stubs keep the old contract while the `.proto` claims the
 new one, and nothing in the build catches the divergence. The stubs' own
 `#if PROTOBUF_VERSION != 7036000` guard pins the generating `protoc` to the
 runtime you link (36.0); see [Building](#building).
+
+### Android build (OpenCL / Adreno GPU)
+
+Runs the draft model on a Snapdragon phone's Adreno GPU through llama.cpp's
+OpenCL backend, instead of its CPU. Verified on a Snapdragon 8 Elite (Adreno
+830) — see llama.cpp's [`docs/backend/OPENCL.md`](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/OPENCL.md)
+and Qualcomm's [backend announcement](https://www.qualcomm.com/developer/blog/2024/11/introducing-new-opn-cl-gpu-backend-llama-cpp-for-qualcomm-adreno-gpu).
+
+**Prerequisites** — the Android NDK (r29 works; `brew install --cask
+android-ndk` puts it in `/opt/homebrew/share/android-ndk`), Ninja, a host
+`python3` (the kernel-embedding step runs `embed_kernel.py`), and gRPC /
+Protobuf **cross-built for `arm64-v8a`** — the same prefix any Android build of
+this project needs, since `CMakeLists.txt` takes them from the system rather
+than `FetchContent`.
+
+**1. OpenCL headers and ICD loader.** llama.cpp's own guide copies these into
+the NDK's sysroot; installing them into the same prefix as gRPC keeps the NDK
+untouched and is found the same way.
+
+```sh
+NDK=/opt/homebrew/share/android-ndk
+PREFIX=$PWD/build/android-deps          # the prefix holding gRPC/Protobuf too
+
+git clone --depth 1 https://github.com/KhronosGroup/OpenCL-Headers
+cmake -S OpenCL-Headers -B ocl-headers-build -G Ninja \
+  -DBUILD_TESTING=OFF -DOPENCL_HEADERS_BUILD_TESTING=OFF \
+  -DOPENCL_HEADERS_BUILD_CXX_TESTS=OFF -DCMAKE_INSTALL_PREFIX="$PREFIX"
+cmake --build ocl-headers-build --target install
+
+git clone --depth 1 https://github.com/KhronosGroup/OpenCL-ICD-Loader
+cmake -S OpenCL-ICD-Loader -B ocl-icd-build -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DANDROID_STL=c++_static \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+  -DOPENCL_ICD_LOADER_HEADERS_DIR="$PREFIX/include" \
+  -DCMAKE_INSTALL_PREFIX="$PREFIX"
+cmake --build ocl-icd-build && cmake --install ocl-icd-build
+```
+
+The `libOpenCL.so` this produces is only a **link-time stand-in**. On the
+device the loader resolves to the vendor's real Adreno driver at
+`/vendor/lib64/libOpenCL.so`, so it is never pushed to the phone.
+
+**2. Configure and build.** Use a separate build directory so a CPU build in
+`build/android` survives alongside it.
+
+```sh
+export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"   # pin pkg-config to the cross prefix
+cmake -S . -B build/android-opencl -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DANDROID_STL=c++_static \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+  -DCMAKE_FIND_ROOT_PATH="$PREFIX" -DCMAKE_PREFIX_PATH="$PREFIX" \
+  -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=ON -DPKG_CONFIG_ARGN=--static \
+  -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_LLAMAFILE=OFF -DLLAMA_OPENSSL=OFF \
+  -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16+i8mm \
+  -DGGML_OPENCL=ON \
+  -DGGML_OPENCL_EMBED_KERNELS=ON \
+  -DGGML_OPENCL_USE_ADRENO_KERNELS=ON \
+  -DOpenCL_INCLUDE_DIR="$PREFIX/include" \
+  -DOpenCL_LIBRARY="$PREFIX/lib/libOpenCL.so"
+cmake --build build/android-opencl -j
+```
+
+Configure should report `Found OpenCL … (found version "3.0")` and `OpenCL will
+use matmul kernels optimized for Adreno`. Both OpenCL options are already ON by
+default; they are passed explicitly so the intent is visible.
+
+| flag | why |
+|---|---|
+| `GGML_OPENCL_EMBED_KERNELS` | compiles the `.cl` sources into the binary — nothing extra to push |
+| `GGML_OPENCL_USE_ADRENO_KERNELS` | Adreno-tuned matmul kernels |
+| `GGML_CPU_ARM_ARCH=…+dotprod+fp16+i8mm` | still worth setting: anything not offloaded runs on CPU, and cross-compiling cannot probe these (needs Snapdragon 8 Gen 1 or newer) |
+| `OpenCL_INCLUDE_DIR` / `OpenCL_LIBRARY` | pointed at the prefix so `find_package(OpenCL)` does not pick up a host OpenCL |
+
+**3. Deploy and run.** The binary links `libOpenCL.so`, resolved on-device from
+`/vendor/lib64`; everything else is static.
+
+```sh
+adb push build/android-opencl/client /data/local/tmp/specedge/client-cl
+adb shell chmod 755 /data/local/tmp/specedge/client-cl
+```
+
+Then set `n_gpu_layers: -1` in the YAML (`0` leaves it on the CPU — the flag is
+what actually moves work to the GPU; building with OpenCL alone changes
+nothing). Confirm the offload from the load log:
+
+```
+ggml_opencl: selected platform: 'QUALCOMM Snapdragon(TM)'
+ggml_opencl: device: 'QUALCOMM Adreno(TM) 830 (OpenCL 3.0 Adreno(TM) 830)'
+llama_prepare_model_devices: using device GPUOpenCL (QUALCOMM Adreno(TM) 830) - 4532 MiB free
+load_tensors: offloaded 29/29 layers to GPU
+```
+
+`./local_test-cl --n-gpu-layers -1` is the quickest way to see those lines
+without needing a target server.
+
+**Troubleshooting**
+
+| symptom | cause |
+|---|---|
+| `CANNOT LINK EXECUTABLE … library "libOpenCL.so" not found` | device has no OpenCL driver, or it is outside the linker namespace; check `ls /vendor/lib64/libOpenCL.so` |
+| build fails in `find_package(OpenCL)` | headers/loader not installed into `$PREFIX`, or `CMAKE_FIND_ROOT_PATH` not pointing at it |
+| runs but `offloaded 0/N layers` | `n_gpu_layers` still `0` in the YAML |
 
 ---
 

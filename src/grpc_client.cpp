@@ -117,4 +117,30 @@ GrpcClient::ValidateResult GrpcClient::Validate(
     return result;
 }
 
+void GrpcClient::Sync(
+    int32_t client_idx, const std::string& exp_name, const std::string& result_path) {
+    SyncRequest request;
+    request.set_client_idx(client_idx);
+    request.set_exp_name(exp_name);
+    request.set_result_path(result_path);
+
+    grpc::ClientContext context;
+    SyncResponse response;
+    grpc::Status status = stub_->Sync(&context, request, &response);
+    if (!status.ok()) {
+        throw std::runtime_error("Sync RPC failed: " + status.error_message());
+    }
+}
+
+bool GrpcClient::Done(int32_t client_idx, bool shutdown) {
+    DoneRequest request;
+    request.set_client_idx(client_idx);
+    request.set_shutdown(shutdown);
+
+    grpc::ClientContext context;
+    DoneResponse response;
+    grpc::Status status = stub_->Done(&context, request, &response);
+    return status.ok();
+}
+
 } // namespace specedge
