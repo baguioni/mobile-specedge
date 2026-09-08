@@ -86,7 +86,17 @@ std::vector<int32_t> ProactiveDraft::FrontierLeaves() const {
 
     std::vector<int32_t> leaves;
     for (int32_t i = prefix; i < end; ++i) {
-        if (!is_parent[static_cast<size_t>(i)]) {
+        // Childless is not sufficient. A node whose children were all dropped
+        // by the budget/top-k selection is childless *and* already decoded, so
+        // it owns a KV cell at its own (seq, pos) -- GrowTree marks exactly
+        // those kProcessed. Forwarding one below would ask llama.cpp to append
+        // a second cell at a position the sequence already holds, which it
+        // refuses ("inconsistent sequence positions: Y = X + 1" and a -1 from
+        // llama_decode), and that failure kills the entire bet. kCandidate is
+        // the only status with no cell yet, which is precisely the set
+        // ChooseBet is allowed to forward.
+        if (!is_parent[static_cast<size_t>(i)] &&
+            tree_.status()[i] == Tree::kCandidate) {
             leaves.push_back(i);
         }
     }

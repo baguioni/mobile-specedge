@@ -41,6 +41,14 @@ namespace specedge {
 //    llama.cpp would append a *second* cell at the same (seq, pos). So
 //    every leaf this scores is marked kProcessed, which is both true and
 //    what stops SpecExecClient's acceptance backfill decoding it twice.
+//    The same constraint runs the other way, which is what FrontierLeaves()
+//    enforces: a node may only be scored if it has no cell *yet*. "Childless"
+//    alone does not mean that -- a node whose children were all dropped by
+//    the budget/top-k selection is childless and already decoded -- so the
+//    frontier is taken by status, not by shape. Getting this wrong is not a
+//    silent inefficiency: llama_decode rejects the whole batch with -1
+//    ("invalid input batch", positions must satisfy Y = X + 1), which loses
+//    every bet rather than just the offending leaf.
 //
 //  - Branch forks are seq_cp, as in SpecExecClient::GrowTree; the caller
 //    supplies the allocator so seq ids stay unique across both.
@@ -100,6 +108,11 @@ private:
 
     // Port of _get_leaves_nodes: frontier nodes of the *current* draft
     // tree, capped at max_n_beams by cumulative logprob. Absolute slots.
+    //
+    // Frontier means childless *and* still kCandidate -- undecoded, so it
+    // owns no KV cell and ChooseBet may forward it. Nodes the drafter already
+    // decoded and then never extended are childless too, but they are
+    // kProcessed and must be left out (see the note above the class).
     std::vector<int32_t> FrontierLeaves() const;
 
     LlamaCppEngine& engine_;
