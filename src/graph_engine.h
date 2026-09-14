@@ -67,6 +67,18 @@ public:
         // every visible CUDA device. Only meaningful with a GPU build and
         // n_gpu_layers != 0.
         bool single_gpu = true;
+        // Comma-separated floats, one per entry in `device` in the same
+        // order (e.g. "1,0" for a 2-device list): the fraction of layers/rows
+        // llama.cpp offloads to each device (llama_model_params::tensor_split).
+        // Only takes effect with single_gpu = false (LLAMA_SPLIT_MODE_NONE
+        // discards every device but main_gpu before tensor_split is ever
+        // read -- see llama_prepare_model_devices in llama.cpp). Empty
+        // leaves llama.cpp's default: split by free memory across every
+        // device in the list. Use this to pin all real layers to one device
+        // (e.g. "1,0") while still keeping a second device in the scheduler
+        // purely as an op-level fallback target (e.g. for topk_sampler.cpp's
+        // SOFT_MAX/TOP_K/GET_ROWS chain on a backend with no TOP_K kernel).
+        std::string tensor_split;
         // Required in tree mode, and must equal the draft's branch width.
         // A backend top-k sampler (topk_sampler.h) is attached to every
         // sequence, which is what makes forward_batch_topk() work and what

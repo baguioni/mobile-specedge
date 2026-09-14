@@ -171,6 +171,25 @@ void LlamaCppEngine::load_model(const Config& config) {
         model_params.devices = devices.data();
     }
 
+    // Must outlive llama_model_load_from_file() below, same as `devices`.
+    // Sized to llama_max_devices() per llama_model_params::tensor_split's
+    // contract, zero-filled past the entries the caller actually gave.
+    std::vector<float> tensor_split;
+    if (!config.tensor_split.empty()) {
+        tensor_split.assign(llama_max_devices(), 0.0f);
+        size_t start = 0, idx = 0;
+        while (start <= config.tensor_split.size() && idx < tensor_split.size()) {
+            size_t comma = config.tensor_split.find(',', start);
+            std::string val = config.tensor_split.substr(start, comma - start);
+            if (!val.empty()) {
+                tensor_split[idx++] = std::stof(val);
+            }
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        model_params.tensor_split = tensor_split.data();
+    }
+
     log_info("Loading GGUF model: %s", config.model_path.c_str());
     model_ = llama_model_load_from_file(config.model_path.c_str(), model_params);
     if (model_ == nullptr) {

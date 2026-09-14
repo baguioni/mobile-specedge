@@ -74,6 +74,8 @@ struct ClientConfig {
     // ("HTP0") specifically when the binary also has GGML_OPENCL compiled
     // in -- otherwise main_gpu is an index into an unspecified device order.
     std::string device;
+    // See LlamaCppEngine::Config::tensor_split.
+    std::string tensor_split;
     std::optional<uint32_t> n_threads;
     std::optional<uint32_t> n_threads_batch;
     // See LlamaCppEngine::Config::flash_attn.
@@ -163,6 +165,7 @@ ClientConfig load_config(const std::string& path) {
     c.main_gpu = node_or<int32_t>(cl["main_gpu"], c.main_gpu);
     c.single_gpu = node_or<bool>(cl["single_gpu"], c.single_gpu);
     c.device = node_or<std::string>(cl["device"], c.device);
+    c.tensor_split = node_or<std::string>(cl["tensor_split"], c.tensor_split);
     if (cl["n_threads"] && !cl["n_threads"].IsNull()) {
         c.n_threads = cl["n_threads"].as<uint32_t>();
     }
@@ -730,6 +733,7 @@ int main(int argc, char** argv) {
         engine_config.main_gpu = cfg.main_gpu;
         engine_config.single_gpu = cfg.single_gpu;
         engine_config.device = cfg.device;
+        engine_config.tensor_split = cfg.tensor_split;
         engine_config.n_threads = cfg.n_threads;
         engine_config.n_threads_batch = cfg.n_threads_batch;
         engine_config.flash_attn = cfg.flash_attn;
