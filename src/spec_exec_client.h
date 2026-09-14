@@ -9,17 +9,18 @@
 #include "llama.h"
 
 #include "graph_engine.h"
-#include "grpc_client.h"
 #include "proactive_draft.h"
 #include "tree.h"
+#include "validator.h"
 
 namespace specedge {
 
 // C++ port of specexec.py's SpecExecClient: tree-based speculative decoding.
 // Each round drafts a token tree locally through LlamaCppEngine (tree mode),
-// verifies every draft node against the target in one GrpcClient::Validate
-// call, accepts the deepest fully-matching root-to-leaf path, and appends
-// one bonus token from the target.
+// verifies every draft node against the target in one Validator::Validate
+// call (GrpcClient in a live run, OracleValidator in a replay), accepts the
+// deepest fully-matching root-to-leaf path, and appends one bonus token from
+// the target.
 //
 // Differences from the Python version, by design:
 //  - No torch::Tensor / device work: Tree (tree.h) plus plain vectors and
@@ -71,7 +72,7 @@ public:
     // and validator are owned by the caller and must outlive this client.
     SpecExecClient(
         LlamaCppEngine& engine,
-        GrpcClient& validator,
+        Validator& validator,
         std::vector<llama_token> prompt_tokens,
         std::string prompt_text,
         Config config);
@@ -129,6 +130,13 @@ private:
     // draft.softmax / draft.topk.
     struct DraftStats {
         std::vector<double> forward_ms;  // engine_.forward_batch_topk
+        // forward_ms split into LlamaCppEngine::ForwardTiming's spans, one
+        // entry per level like forward_ms. What forward_ms holds beyond
+        // their sum is batch setup.
+        std::vector<double> decode_ms;
+        std::vector<double> sync_ms;
+        std::vector<double> readback_ms;
+        std::vector<double> forward_log_ms;
         std::vector<double> fork_ms;     // seq_cp branch forks + tree_.add
         std::vector<int32_t> n_beams;    // rows expanded at this level
     };
@@ -184,7 +192,7 @@ private:
         double target_end_to_end_ms);
 
     LlamaCppEngine& engine_;
-    GrpcClient& validator_;
+    Validator& validator_;
     std::string prompt_text_;
     Config config_;
 

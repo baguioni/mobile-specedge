@@ -25,8 +25,10 @@ struct Args {
     int32_t max_len = 256;
     int32_t n_generate = 8;
     int32_t n_gpu_layers = 0;
+    std::string device;
     std::optional<uint32_t> n_threads;
     std::optional<uint32_t> n_threads_batch;
+    std::optional<bool> flash_attn;
 };
 
 void print_usage(const char* argv0) {
@@ -37,8 +39,10 @@ void print_usage(const char* argv0) {
         "  --max-len <n>             Context / max_len passed to GraphEngine (default: 256)\n"
         "  --n-generate <n>          Number of tokens to greedily decode (default: 8)\n"
         "  --n-gpu-layers <n>        Layers to offload to GPU, -1 for all (default: 0)\n"
+        "  --device <name[,name..]>  Pin ggml backend device(s), e.g. HTP0 (default: all registered)\n"
         "  --n-threads <n>           Decode thread count (default: llama.cpp's own default)\n"
         "  --n-threads-batch <n>     Batch thread count (default: same as --n-threads)\n"
+        "  --flash-attn <0|1>        Force flash-attn off/on (default: llama.cpp's auto)\n"
         "  -h, --help                Show this message\n",
         argv0, kDefaultModel, kDefaultPrompt);
 }
@@ -72,12 +76,18 @@ bool parse_args(int argc, char** argv, Args& args) {
         } else if (arg == "--n-gpu-layers") {
             if (!(value = next_value(i))) { std::fprintf(stderr, "--n-gpu-layers needs a value\n"); return false; }
             args.n_gpu_layers = std::stoi(*value);
+        } else if (arg == "--device") {
+            if (!(value = next_value(i))) { std::fprintf(stderr, "--device needs a value\n"); return false; }
+            args.device = *value;
         } else if (arg == "--n-threads") {
             if (!(value = next_value(i))) { std::fprintf(stderr, "--n-threads needs a value\n"); return false; }
             args.n_threads = static_cast<uint32_t>(std::stoul(*value));
         } else if (arg == "--n-threads-batch") {
             if (!(value = next_value(i))) { std::fprintf(stderr, "--n-threads-batch needs a value\n"); return false; }
             args.n_threads_batch = static_cast<uint32_t>(std::stoul(*value));
+        } else if (arg == "--flash-attn") {
+            if (!(value = next_value(i))) { std::fprintf(stderr, "--flash-attn needs a value\n"); return false; }
+            args.flash_attn = (std::stoi(*value) != 0);
         } else {
             std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
             print_usage(argv[0]);
@@ -125,8 +135,10 @@ int main(int argc, char** argv) {
     config.max_len = args.max_len;
     config.max_n_beams = 1;
     config.n_gpu_layers = args.n_gpu_layers;
+    config.device = args.device;
     config.n_threads = args.n_threads;
     config.n_threads_batch = args.n_threads_batch;
+    config.flash_attn = args.flash_attn;
     config.role = "local_test";
 
     specedge::LlamaCppEngine engine(config);

@@ -26,6 +26,14 @@
 //  - Shuffle uses std::mt19937 seeded with client_idx, so the visiting
 //    order is deterministic per client but not bit-identical to CPython's
 //    random.shuffle().
+//
+// Replay mode (--replay <trace.jsonl>) swaps the target for an
+// OracleValidator: each request of an earlier run is re-drafted from its
+// recorded prompt_tokens and judged against its recorded output_tokens, so
+// no server is contacted and the config's host / dataset fields go unused.
+// Engine, tree and proactive settings still come from the YAML and outputs
+// land in the same files, so draft_breakdown.py and compare_runs.py read a
+// replay like a live run. mobile.py does not: there is no server.jsonl.
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -48,6 +56,7 @@
 
 #include "graph_engine.h"
 #include "grpc_client.h"
+#include "oracle_validator.h"
 #include "spec_exec_client.h"
 
 namespace {
@@ -61,8 +70,18 @@ struct ClientConfig {
     // true (default) pins the draft model to a single GPU (main_gpu);
     // false lets llama.cpp split its layers across all visible GPUs.
     bool single_gpu = true;
+    // See LlamaCppEngine::Config::device. Needed to pin the Hexagon NPU
+    // ("HTP0") specifically when the binary also has GGML_OPENCL compiled
+    // in -- otherwise main_gpu is an index into an unspecified device order.
+    std::string device;
     std::optional<uint32_t> n_threads;
     std::optional<uint32_t> n_threads_batch;
+    // See LlamaCppEngine::Config::flash_attn.
+    std::optional<bool> flash_attn;
+    // Where the draft's log-softmax + top-k runs: "backend" (a sampler in
+    // the decode graph, topk_sampler.h) or "host" (HostTopK over the raw
+    // logits, host_topk.h). See LlamaCppEngine::Config::host_topk.
+    std::string draft_scoring = "backend";
 
     // target + decoding (SpecExec drafting parameters, see
     // spec_exec_client.h)
@@ -111,8 +130,16 @@ constexpr const char* kDataDir = "data";
 
 void print_usage(const char* argv0) {
     std::fprintf(stderr,
-        "Usage: %s [--config <path>]\n"
+        "Usage: %s [--config <path>] [--exp-name <name>]\n"
+        "          [--replay <trace.jsonl> [--replay-limit <n>] [--sim-rtt-ms <ms>]]\n"
         "  --config, -c <path>   YAML client config (default: config/client.example.yaml)\n"
+        "  --exp-name <name>     override client.exp_name, i.e. where outputs go\n"
+        "  --replay <path>       draft-only replay of a recorded run's trace.jsonl: no\n"
+        "                        target server, the recorded completions judge each\n"
+        "                        round (see src/oracle_validator.h)\n"
+        "  --replay-limit <n>    replay only the trace's first n requests\n"
+        "  --sim-rtt-ms <ms>     replay: sleep this long per round in place of the\n"
+        "                        target round trip (default 0)\n"
         "  -h, --help            Show this message\n",
         argv0);
 }
@@ -135,11 +162,19 @@ ClientConfig load_config(const std::string& path) {
     c.n_gpu_layers = node_or<int32_t>(cl["n_gpu_layers"], c.n_gpu_layers);
     c.main_gpu = node_or<int32_t>(cl["main_gpu"], c.main_gpu);
     c.single_gpu = node_or<bool>(cl["single_gpu"], c.single_gpu);
+    c.device = node_or<std::string>(cl["device"], c.device);
     if (cl["n_threads"] && !cl["n_threads"].IsNull()) {
         c.n_threads = cl["n_threads"].as<uint32_t>();
     }
     if (cl["n_threads_batch"] && !cl["n_threads_batch"].IsNull()) {
         c.n_threads_batch = cl["n_threads_batch"].as<uint32_t>();
+    }
+    if (cl["flash_attn"] && !cl["flash_attn"].IsNull()) {
+        c.flash_attn = cl["flash_attn"].as<bool>();
+    }
+    c.draft_scoring = node_or<std::string>(cl["draft_scoring"], c.draft_scoring);
+    if (c.draft_scoring != "backend" && c.draft_scoring != "host") {
+        throw std::runtime_error("config: client.draft_scoring must be backend or host");
     }
 
     c.host = node_or<std::string>(cl["host"], c.host);
@@ -486,10 +521,165 @@ std::vector<int32_t> build_request_indices(int32_t dataset_len, const ClientConf
     return req_indices;
 }
 
+specedge::SpecExecClient::Config make_client_config(
+    const ClientConfig& cfg, const std::string& log_dir) {
+    specedge::SpecExecClient::Config client_config;
+    client_config.max_n_beams = cfg.max_n_beams;
+    client_config.max_beam_len = cfg.max_beam_len;
+    client_config.max_branch_width = cfg.max_branch_width;
+    client_config.max_budget = cfg.max_budget;
+    client_config.max_new_tokens = cfg.max_new_tokens;
+    client_config.client_idx = cfg.client_idx;
+    client_config.log_dir = log_dir;
+    client_config.proactive_type =
+        specedge::SpecExecClient::ParseProactiveType(cfg.proactive_type);
+    client_config.proactive.max_n_beams = cfg.proactive_max_n_beams;
+    client_config.proactive.max_beam_len = cfg.proactive_max_beam_len;
+    client_config.proactive.max_branch_width = cfg.proactive_max_branch_width;
+    client_config.proactive.max_budget = cfg.proactive_max_budget;
+    return client_config;
+}
+
+// One request of a recorded run, as TraceWriter wrote it.
+struct ReplayRequest {
+    int32_t req_idx = 0;
+    std::string prompt_text;
+    std::vector<llama_token> prompt_tokens;
+    std::vector<llama_token> output_tokens;
+};
+
+// Reads a trace.jsonl in file order, which is the order the recorded run
+// visited its requests -- so a replay meets them in the same sequence and
+// the draft device goes through the same load history. Requests the
+// recorded run skipped, or that produced nothing, have no reference and are
+// dropped. limit < 0 keeps every request.
+std::vector<ReplayRequest> load_replay_trace(const std::string& path, int32_t limit) {
+    std::ifstream f(path);
+    if (!f) {
+        throw std::runtime_error("could not open replay trace " + path);
+    }
+    std::vector<ReplayRequest> requests;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        const nlohmann::json row = nlohmann::json::parse(line);
+        if (row.value("stop_reason", std::string()) == "skipped_max_len") {
+            continue;
+        }
+        ReplayRequest r;
+        r.req_idx = row.at("req_idx").get<int32_t>();
+        r.prompt_text = row.value("prompt_text", std::string());
+        r.prompt_tokens = row.at("prompt_tokens").get<std::vector<llama_token>>();
+        r.output_tokens = row.at("output_tokens").get<std::vector<llama_token>>();
+        if (r.prompt_tokens.empty() || r.output_tokens.empty()) {
+            continue;
+        }
+        requests.push_back(std::move(r));
+        if (limit >= 0 && static_cast<int32_t>(requests.size()) >= limit) {
+            break;
+        }
+    }
+    if (requests.empty()) {
+        throw std::runtime_error("replay trace " + path + " has no usable requests");
+    }
+    return requests;
+}
+
+struct ReplayOptions {
+    std::string trace_path;
+    int32_t limit = -1;
+    double sim_rtt_ms = 0.0;
+};
+
+// The --replay loop: the live loop's shape, with each request's recorded
+// completion standing in for the target (see oracle_validator.h).
+int run_replay(
+    const ClientConfig& cfg,
+    specedge::LlamaCppEngine& engine,
+    const std::string& log_dir,
+    const ReplayOptions& opts) {
+    const std::vector<ReplayRequest> requests = load_replay_trace(opts.trace_path, opts.limit);
+    const llama_vocab* vocab = engine.vocab();
+
+    TraceWriter trace(log_dir);
+
+    std::fprintf(stderr,
+        "Replaying %zu requests from %s against their recorded completions "
+        "(no target server, sim_rtt_ms=%.1f)\n",
+        requests.size(), opts.trace_path.c_str(), opts.sim_rtt_ms);
+
+    int32_t n_past_end = 0;
+    for (size_t k = 0; k < requests.size(); ++k) {
+        const ReplayRequest& req = requests[k];
+        std::fprintf(stderr, "Request %zu/%zu, req_idx: %d\n",
+                     k + 1, requests.size(), req.req_idx);
+
+        if (static_cast<int32_t>(req.prompt_tokens.size()) + cfg.max_new_tokens > cfg.max_len) {
+            std::fprintf(stderr,
+                "  Skipping req_idx=%d: %zu prompt + %d new tokens exceeds max_len=%d\n",
+                req.req_idx, req.prompt_tokens.size(), cfg.max_new_tokens, cfg.max_len);
+            trace.Add(req.req_idx, req.prompt_text, "", req.prompt_tokens, {}, "skipped_max_len");
+            continue;
+        }
+
+        std::vector<llama_token> reference = req.prompt_tokens;
+        reference.insert(reference.end(), req.output_tokens.begin(), req.output_tokens.end());
+        specedge::OracleValidator oracle(reference, llama_vocab_eos(vocab), opts.sim_rtt_ms);
+
+        specedge::SpecExecClient client(
+            engine, oracle, req.prompt_tokens, req.prompt_text, make_client_config(cfg, log_dir));
+        specedge::SpecExecClient::GenerateTrace gen_trace;
+        client.Generate(req.req_idx, &gen_trace);
+
+        // The oracle only ever accepts reference tokens, so everything
+        // committed must be the reference; anything else means its position
+        // mapping is wrong and every number from this replay with it. Past
+        // the reference's end it answers EOS, so a longer sequence means the
+        // final round outran the recording.
+        const size_t n_common = std::min(gen_trace.tokens.size(), reference.size());
+        for (size_t i = 0; i < n_common; ++i) {
+            if (gen_trace.tokens[i] != reference[i]) {
+                throw std::runtime_error(
+                    "replay of req_idx=" + std::to_string(req.req_idx) +
+                    " diverged from its reference at token " + std::to_string(i));
+            }
+        }
+        const bool past_end = gen_trace.tokens.size() > reference.size();
+        n_past_end += past_end ? 1 : 0;
+
+        const std::vector<llama_token> traced_output(
+            gen_trace.tokens.begin() + static_cast<std::ptrdiff_t>(req.prompt_tokens.size()),
+            gen_trace.tokens.end());
+        trace.Add(
+            req.req_idx, req.prompt_text, detokenize(vocab, traced_output),
+            req.prompt_tokens, traced_output,
+            past_end ? "reference_end" : gen_trace.stopped_on_eog ? "eos" : "max_new_tokens");
+
+        std::printf("=== req_idx=%d (%zu/%zu) replayed: %zu tokens ===\n",
+                    req.req_idx, k + 1, requests.size(), traced_output.size());
+        std::fflush(stdout);
+    }
+
+    trace.Close();
+
+    if (n_past_end > 0) {
+        std::fprintf(stderr,
+            "note: %d request(s) ran past the end of their recorded completion on the "
+            "final round (trace stop_reason \"reference_end\"); that round's acceptance "
+            "is capped by the recording, not the draft\n",
+            n_past_end);
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::string config_path = "config/client.example.yaml";
+    std::string exp_name_override;
+    ReplayOptions replay;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -497,6 +687,14 @@ int main(int argc, char** argv) {
             return 0;
         } else if ((arg == "-c" || arg == "--config") && i + 1 < argc) {
             config_path = argv[++i];
+        } else if (arg == "--exp-name" && i + 1 < argc) {
+            exp_name_override = argv[++i];
+        } else if (arg == "--replay" && i + 1 < argc) {
+            replay.trace_path = argv[++i];
+        } else if (arg == "--replay-limit" && i + 1 < argc) {
+            replay.limit = std::stoi(argv[++i]);
+        } else if (arg == "--sim-rtt-ms" && i + 1 < argc) {
+            replay.sim_rtt_ms = std::stod(argv[++i]);
         } else {
             std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
             print_usage(argv[0]);
@@ -505,7 +703,11 @@ int main(int argc, char** argv) {
     }
 
     try {
-        const ClientConfig cfg = load_config(config_path);
+        ClientConfig loaded = load_config(config_path);
+        if (!exp_name_override.empty()) {
+            loaded.exp_name = exp_name_override;
+        }
+        const ClientConfig& cfg = loaded;
 
         // <result_path>/<exp_name> when both are set, else ./log. Exported
         // before the engine is built because LlamaCppEngine resolves
@@ -527,14 +729,22 @@ int main(int argc, char** argv) {
         engine_config.n_gpu_layers = cfg.n_gpu_layers;
         engine_config.main_gpu = cfg.main_gpu;
         engine_config.single_gpu = cfg.single_gpu;
+        engine_config.device = cfg.device;
         engine_config.n_threads = cfg.n_threads;
         engine_config.n_threads_batch = cfg.n_threads_batch;
+        engine_config.flash_attn = cfg.flash_attn;
         // Scores the draft tree on the device; the sampler's k is the branch
         // width because it decides each beam's children. See topk_sampler.h.
         engine_config.draft_top_k = cfg.max_branch_width;
+        engine_config.host_topk = cfg.draft_scoring == "host";
         engine_config.role = "tree_client";
 
         specedge::LlamaCppEngine engine(engine_config);
+
+        if (!replay.trace_path.empty()) {
+            return run_replay(cfg, engine, log_dir, replay);
+        }
+
         specedge::GrpcClient validator(cfg.host);
         validator.client_idx = cfg.client_idx;
         validator.attention_mask_dtype =
@@ -579,23 +789,8 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            specedge::SpecExecClient::Config client_config;
-            client_config.max_n_beams = cfg.max_n_beams;
-            client_config.max_beam_len = cfg.max_beam_len;
-            client_config.max_branch_width = cfg.max_branch_width;
-            client_config.max_budget = cfg.max_budget;
-            client_config.max_new_tokens = cfg.max_new_tokens;
-            client_config.client_idx = cfg.client_idx;
-            client_config.log_dir = log_dir;
-            client_config.proactive_type =
-                specedge::SpecExecClient::ParseProactiveType(cfg.proactive_type);
-            client_config.proactive.max_n_beams = cfg.proactive_max_n_beams;
-            client_config.proactive.max_beam_len = cfg.proactive_max_beam_len;
-            client_config.proactive.max_branch_width = cfg.proactive_max_branch_width;
-            client_config.proactive.max_budget = cfg.proactive_max_budget;
-
             specedge::SpecExecClient client(
-                engine, validator, prompt_tokens, prompt, client_config);
+                engine, validator, prompt_tokens, prompt, make_client_config(cfg, log_dir));
             specedge::SpecExecClient::GenerateTrace gen_trace;
             const std::vector<llama_token> generated = client.Generate(req_idx, &gen_trace);
 

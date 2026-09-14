@@ -138,7 +138,7 @@ SpecExecClient::ProactiveType SpecExecClient::ParseProactiveType(const std::stri
 
 SpecExecClient::SpecExecClient(
     LlamaCppEngine& engine,
-    GrpcClient& validator,
+    Validator& validator,
     std::vector<llama_token> prompt_tokens,
     std::string prompt_text,
     Config config)
@@ -314,6 +314,10 @@ std::vector<llama_token> SpecExecClient::RunCycle(int32_t req_idx, int32_t step_
 
 void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
     stats.forward_ms.clear();
+    stats.decode_ms.clear();
+    stats.sync_ms.clear();
+    stats.readback_ms.clear();
+    stats.forward_log_ms.clear();
     stats.fork_ms.clear();
     stats.n_beams.clear();
 
@@ -403,6 +407,11 @@ void SpecExecClient::GrowTree(bool prefill, DraftStats& stats) {
         LlamaCppEngine::TopKRows top =
             engine_.forward_batch_topk(in_tokens, in_pos, in_seqs, candidates);
         stats.forward_ms.push_back(MillisSince(forward_start));
+        const LlamaCppEngine::ForwardTiming& timing = engine_.last_forward_timing();
+        stats.decode_ms.push_back(timing.decode_ms);
+        stats.sync_ms.push_back(timing.sync_ms);
+        stats.readback_ms.push_back(timing.readback_ms);
+        stats.forward_log_ms.push_back(timing.log_ms);
         stats.n_beams.push_back(n_beams);
 
         std::vector<float> beam_scores(n_beams);
@@ -664,7 +673,7 @@ std::vector<llama_token> SpecExecClient::ValidateTree(
             prefill ? std::optional<std::string>(prompt_text_) : std::nullopt);
     };
 
-    GrpcClient::ValidateResult result;
+    Validator::Result result;
     std::optional<ProactiveDraft::Result> bet;
 
     if (proactive_ == nullptr) {
@@ -672,7 +681,7 @@ std::vector<llama_token> SpecExecClient::ValidateTree(
         // pre-proactive path, unchanged.
         result = do_validate();
     } else {
-        std::future<GrpcClient::ValidateResult> rpc =
+        std::future<Validator::Result> rpc =
             std::async(std::launch::async, do_validate);
 
         // Bet on the bonus token and pre-grow next round's tree while the
@@ -880,6 +889,13 @@ void SpecExecClient::LogCycle(
     entry["context_len"] = context_len;
     entry["prompt_len"] = prompt_len_;
     entry["draft"]["forward"] = draft_stats.forward_ms;
+    // forward's components (LlamaCppEngine::ForwardTiming): compute, the
+    // wait for queued backend work, reading the sampled rows back, and the
+    // graph-engine.log record.
+    entry["draft"]["decode"] = draft_stats.decode_ms;
+    entry["draft"]["sync"] = draft_stats.sync_ms;
+    entry["draft"]["readback"] = draft_stats.readback_ms;
+    entry["draft"]["forward_log"] = draft_stats.forward_log_ms;
     entry["draft"]["fork"] = draft_stats.fork_ms;
     entry["draft"]["n_beams"] = draft_stats.n_beams;
     entry["draft"]["end_to_end"] = draft_end_to_end_ms;

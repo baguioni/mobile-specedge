@@ -12,6 +12,16 @@ This splits it into the spans GrowTree emits:
 A residual anywhere near the size of the spans means the cost is somewhere
 this breakdown does not yet look, and the spans need extending.
 
+Newer logs also split forward itself (LlamaCppEngine::ForwardTiming):
+
+    decode       llama_decode      (graph build + schedule + compute)
+    sync         llama_synchronize (backend work llama_decode left queued)
+    readback     llama_get_sampled_* over every row
+    forward_log  the graph-engine.log record
+
+Those are reported under the main table, and as extra --per-level columns,
+when present.
+
 Logs written while scoring still ran on the host also carry `softmax` and
 `topk` spans. Those are picked up automatically when present, so old and
 new runs can both be read with this script.
@@ -28,6 +38,7 @@ from pathlib import Path
 # Present in every log. Host-scoring spans are added per-file when found.
 BASE_SPANS = ("forward", "fork")
 LEGACY_SPANS = ("softmax", "topk")
+FORWARD_PARTS = ("decode", "sync", "readback", "forward_log")
 
 
 def load(folder: Path):
@@ -66,7 +77,12 @@ def resolve_spans(rows):
     return spans
 
 
-def summarize(rows, label, spans):
+def resolve_parts(rows):
+    """forward's sub-spans, when every record carries them."""
+    return tuple(p for p in FORWARD_PARTS if all(p in r["draft"] for r in rows))
+
+
+def summarize(rows, label, spans, parts=()):
     per_step = {s: [sum(r["draft"][s]) for r in rows] for s in spans}
     resid = [r["draft"]["residual"] for r in rows]
     e2e = [r["draft"]["end_to_end"] for r in rows]
@@ -90,7 +106,16 @@ def summarize(rows, label, spans):
     print(f"{'target':<12}{st.mean(target):>10.2f}{'':>10}{100 * st.mean(target) / step_mean:>8.1f}%")
     print(f"{'STEP':<12}{step_mean:>10.2f}")
 
-    cpu = sum(st.mean(per_step[s]) for s in spans if s != "forward") + st.mean(resid)
+    if parts:
+        fwd = st.mean(per_step["forward"])
+        part_means = {p: st.mean(sum(r["draft"][p]) for r in rows) for p in parts}
+        print(f"\n  forward split{'':<9}{'mean ms':>10}{'% fwd':>9}")
+        for p, m in part_means.items():
+            print(f"    {p:<18}{m:>10.2f}{100 * m / fwd:>8.1f}%")
+        setup = fwd - sum(part_means.values())
+        print(f"    {'(batch setup)':<18}{setup:>10.2f}{100 * setup / fwd:>8.1f}%")
+
+    cpu =sum(st.mean(per_step[s]) for s in spans if s != "forward") + st.mean(resid)
     acc_mean = st.mean(accepted)
     print(f"\n  accepted/step {acc_mean:.3f}   ->  {step_mean / acc_mean:.2f} ms/tok"
           f"   ({1000 * acc_mean / step_mean:.1f} tok/s)")
@@ -100,17 +125,18 @@ def summarize(rows, label, spans):
           f"   ({1000 * acc_mean / (step_mean - cpu):.1f} tok/s)")
 
 
-def per_level(rows, spans):
+def per_level(rows, spans, parts=()):
     """Cost by tree level. Host-side spans scale linearly with n_beams;
     forward grows more slowly, since it is one batched decode either way."""
+    cols = tuple(spans) + tuple(parts)
     depth = max(len(r["draft"]["forward"]) for r in rows)
     print(f"\n===== per tree level =====")
-    print(f"{'level':<7}{'beams':>7}" + "".join(f"{s:>10}" for s in spans))
-    print("-" * (14 + 10 * len(spans)))
+    print(f"{'level':<7}{'beams':>7}" + "".join(f"{s:>12}" for s in cols))
+    print("-" * (14 + 12 * len(cols)))
     for lvl in range(depth):
         at = [r for r in rows if len(r["draft"]["forward"]) > lvl]
         beams = st.mean(r["draft"]["n_beams"][lvl] for r in at)
-        cells = "".join(f"{st.mean([r['draft'][s][lvl] for r in at]):>10.2f}" for s in spans)
+        cells = "".join(f"{st.mean([r['draft'][s][lvl] for r in at]):>12.2f}" for s in cols)
         print(f"{lvl:<7}{beams:>7.1f}{cells}")
 
 
@@ -122,12 +148,13 @@ def main():
 
     rows = load(args.data_folder)
     spans = resolve_spans(rows)
+    parts = resolve_parts(rows)
 
     non_prefill = [r for r in rows if r["step_idx"] != 0]
-    summarize(rows, "ALL STEPS", spans)
-    summarize(non_prefill, "NON-PREFILL", spans)
+    summarize(rows, "ALL STEPS", spans, parts)
+    summarize(non_prefill, "NON-PREFILL", spans, parts)
     if args.per_level:
-        per_level(non_prefill, spans)
+        per_level(non_prefill, spans, parts)
 
 
 if __name__ == "__main__":

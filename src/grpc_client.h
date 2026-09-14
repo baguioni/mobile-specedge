@@ -10,6 +10,7 @@
 
 #include "llama.h"
 #include "specedge_grpc/specedge.grpc.pb.h"
+#include "validator.h"
 
 namespace specedge {
 
@@ -36,19 +37,9 @@ namespace specedge {
 //    async event loop (LlamaCppEngine is fully synchronous too), so
 //    Validate() blocks on the underlying grpc::Channel like every other
 //    call site here.
-class GrpcClient {
+class GrpcClient : public Validator {
 public:
-    struct ValidateResult {
-        // Wire dtype is fixed by the server contract (torch.long on the
-        // Python side), independent of whatever width input_ids etc. use.
-        std::vector<int64_t> selection;
-        // Number of prefill requests the server bundled into the batch that
-        // served this call (ValidateResponse.prefill, i.e. grpc.py's
-        // returned `prefill_cnt`). 0 on a pure decode round; kept as the
-        // count rather than a bool so it matches specexec.py's
-        // target.prefill result field.
-        int32_t prefill = 0;
-    };
+    using ValidateResult = Validator::Result;
 
     explicit GrpcClient(const std::string& host);
 
@@ -90,7 +81,7 @@ public:
         const std::vector<float>& attention_mask,
         const std::vector<int32_t>& parent_indices,
         bool prefill = false,
-        std::optional<std::string> prefix = std::nullopt);
+        std::optional<std::string> prefix = std::nullopt) override;
 
     // Experiment handshake, mirroring client.py's stub.Sync() before the
     // request loop. exp_name / result_path travel with it so a *persistent*

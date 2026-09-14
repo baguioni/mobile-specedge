@@ -72,7 +72,9 @@ pkg_check_modules(GRPC REQUIRED grpc++)
 
 add_library(graph_engine_lib
 src/graph_engine.cpp
+src/host_topk.cpp
 src/grpc_client.cpp
+src/oracle_validator.cpp
 src/tree.cpp
 src/spec_exec_client.cpp
 src/proactive_draft.cpp

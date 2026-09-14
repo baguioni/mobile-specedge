@@ -10,6 +10,8 @@
 
 #include "llama.h"
 
+#include "host_topk.h"
+
 namespace specedge {
 
 // C++ port of graph.py's engine role, on top of llama.cpp's KV cache.
@@ -51,6 +53,14 @@ public:
         int32_t max_seqs = 1;
         int32_t n_gpu_layers = 0;
         int32_t main_gpu = 0;
+        // Comma-separated ggml backend device names (e.g. "HTP0", or
+        // "HTP0,HTP1"), resolved via ggml_backend_dev_by_name() into
+        // llama_model_params::devices. Empty leaves llama.cpp's default of
+        // considering every registered device, in which case main_gpu is an
+        // index into whatever order they happened to register in -- with
+        // both GGML_OPENCL and GGML_HEXAGON compiled in, that is NOT
+        // reliably "the NPU" at index 0. Set this to pin a specific one.
+        std::string device;
         // Pin the whole model to a single GPU (main_gpu). true selects
         // llama.cpp's LLAMA_SPLIT_MODE_NONE; false restores the library
         // default (LLAMA_SPLIT_MODE_LAYER), which spreads layers across
@@ -63,12 +73,27 @@ public:
         // stops llama.cpp copying raw logits to the host. Left at 0 in
         // linear mode, which has no sampler and returns full logits.
         int32_t draft_top_k = 0;
+        // Tree mode only. Score the draft on the host instead of on the
+        // backend: no sampler is attached, llama.cpp hands back each row's
+        // raw logits, and HostTopK (host_topk.h) does the full-vocabulary
+        // log-softmax + top-k across n_threads host threads. For a backend
+        // that cannot run the sampler's ops -- Hexagon has no TOP_K, and a
+        // sampler split between NPU and CPU costs two graph splits per
+        // sequence. draft_top_k still sets k.
+        bool host_topk = false;
         std::string role = "unknown";
         // Optional external vocab size (e.g. an HF tokenizer's vocab_size)
         // to sanity-check against the GGUF's own vocab. Skipped if unset.
         std::optional<int32_t> expected_vocab_size;
         std::optional<uint32_t> n_threads;
         std::optional<uint32_t> n_threads_batch;
+        // Unset leaves llama.cpp's own default (LLAMA_FLASH_ATTN_TYPE_AUTO).
+        // true/false force LLAMA_FLASH_ATTN_TYPE_ENABLED/DISABLED. Matters
+        // most on the Hexagon backend, whose HMX flash-attention kernel
+        // wins on both prefill and decode-at-depth (see
+        // mobile-benchmarks/hexagon-npu-benchmark.md) -- the opposite of
+        // CPU/Adreno, where FA hurts decode.
+        std::optional<bool> flash_attn;
     };
 
     explicit LlamaCppEngine(Config config);
@@ -122,6 +147,25 @@ public:
         const std::vector<llama_pos>& position_ids,
         const std::vector<int32_t>& seq_ids,
         const std::vector<int32_t>& slot_indices);
+
+    // Wall-clock split of the most recent forward_batch_topk() call, in ms.
+    // The four spans cover the whole call bar argument checks and batch
+    // setup, so they are what a caller's own span around it decomposes into.
+    struct ForwardTiming {
+        // llama_decode(): graph build, scheduling and -- on a synchronous
+        // backend -- all of the compute, sampler subgraph included.
+        double decode_ms = 0.0;
+        // llama_synchronize(): whatever llama_decode() left queued on an
+        // asynchronous backend. Near zero on a synchronous one.
+        double sync_ms = 0.0;
+        // The llama_get_sampled_* reads over every row -- or, with
+        // Config::host_topk, reading the raw logits plus the host
+        // log-softmax + top-k.
+        double readback_ms = 0.0;
+        // Writing the graph-engine.log record, detokenization included.
+        double log_ms = 0.0;
+    };
+    const ForwardTiming& last_forward_timing() const { return last_forward_timing_; }
 
     // Tree mode only: forks a draft branch. Under kv_unified this is a
     // tag-only copy -- every cell of src_seq (the root..fork path) gains
@@ -220,6 +264,8 @@ private:
     // must outlive ctx_ -- they are freed after llama_free() in close().
     int32_t draft_top_k_ = 0;
     std::vector<llama_sampler*> samplers_;
+    // Set instead of samplers_ when Config::host_topk is.
+    std::unique_ptr<HostTopK> host_topk_;
     bool tree_mode_ = false;
 
     int32_t seq_len_ = 0;
@@ -236,6 +282,8 @@ private:
     int32_t n_batch_ = 0;
     int32_t n_vocab_ = 0;
     bool closed_ = false;
+
+    ForwardTiming last_forward_timing_;
 
     std::shared_ptr<std::ofstream> forward_log_;
 };

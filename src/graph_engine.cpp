@@ -94,13 +94,13 @@ LlamaCppEngine::LlamaCppEngine(Config config)
       max_seqs_(config.max_seqs),
       draft_top_k_(config.draft_top_k),
       tree_mode_(config.max_seqs > 1) {
-    // Tree drafting scores on the backend, which means a sampler on every
-    // sequence -- there is no host-scoring path to fall back to.
+    // Tree drafting reads k candidates per row, from the backend sampler or,
+    // with host_topk, from HostTopK -- either way k has to be set.
     if (config.max_seqs > 1 && draft_top_k_ <= 0) {
         throw std::invalid_argument(
             "LlamaCppEngine: tree mode requires draft_top_k > 0 (set it to the "
             "draft's max_branch_width). Tree drafting reads its candidates "
-            "from the backend sampler.");
+            "from the backend sampler or, with host_topk, the host top-k.");
     }
     if (draft_top_k_ > 0 && config.max_seqs <= 1) {
         throw std::invalid_argument(
@@ -148,6 +148,29 @@ void LlamaCppEngine::load_model(const Config& config) {
         config.single_gpu ? LLAMA_SPLIT_MODE_NONE : LLAMA_SPLIT_MODE_LAYER;
     model_params.main_gpu = config.main_gpu;
 
+    // Explicit device pin (see Config::device). Must outlive
+    // llama_model_load_from_file() below, not the function -- llama.cpp
+    // copies the pointers out during load.
+    std::vector<ggml_backend_dev_t> devices;
+    if (!config.device.empty()) {
+        size_t start = 0;
+        while (start <= config.device.size()) {
+            size_t comma = config.device.find(',', start);
+            std::string name = config.device.substr(start, comma - start);
+            if (!name.empty()) {
+                ggml_backend_dev_t dev = ggml_backend_dev_by_name(name.c_str());
+                if (dev == nullptr) {
+                    throw std::runtime_error("Unknown backend device: " + name);
+                }
+                devices.push_back(dev);
+            }
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        devices.push_back(nullptr);  // NULL-terminated, per llama_model_params::devices
+        model_params.devices = devices.data();
+    }
+
     log_info("Loading GGUF model: %s", config.model_path.c_str());
     model_ = llama_model_load_from_file(config.model_path.c_str(), model_params);
     if (model_ == nullptr) {
@@ -185,6 +208,11 @@ void LlamaCppEngine::load_model(const Config& config) {
     } else if (config.n_threads.has_value()) {
         ctx_params.n_threads_batch = static_cast<int32_t>(*config.n_threads);
     }
+    if (config.flash_attn.has_value()) {
+        ctx_params.flash_attn_type = *config.flash_attn
+            ? LLAMA_FLASH_ATTN_TYPE_ENABLED
+            : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
 
     // One backend top-k sampler per sequence. llama.cpp only skips its
     // raw-logits device->host copy when *every* output sequence has one
@@ -192,7 +220,15 @@ void LlamaCppEngine::load_model(const Config& config) {
     // finds an output token on a sequence without a sampler), so this
     // covers all of [0, n_seq_max) rather than just the ones in use.
     std::vector<llama_sampler_seq_config> sampler_configs;
-    if (draft_top_k_ > 0) {
+    if (draft_top_k_ > 0 && config.host_topk) {
+        // No sampler at all, so llama.cpp copies every output row's logits
+        // to the host and forward_batch_topk scores them there.
+        const int32_t n_threads =
+            config.n_threads.has_value() ? static_cast<int32_t>(*config.n_threads) : 4;
+        host_topk_ = std::make_unique<HostTopK>(draft_top_k_, n_vocab_, n_threads);
+        log_info("Host top-k: no backend sampler; raw logits come back and "
+                 "log-softmax + top-%d runs on %d host threads", draft_top_k_, n_threads);
+    } else if (draft_top_k_ > 0) {
         samplers_.reserve(static_cast<size_t>(n_seq_max));
         sampler_configs.reserve(static_cast<size_t>(n_seq_max));
         for (int32_t seq = 0; seq < n_seq_max; ++seq) {
@@ -277,6 +313,7 @@ void LlamaCppEngine::close() {
         llama_sampler_free(smpl);
     }
     samplers_.clear();
+    host_topk_.reset();
     if (model_ != nullptr) {
         llama_model_free(model_);
         model_ = nullptr;
@@ -405,7 +442,7 @@ void LlamaCppEngine::log_forward_topk(
     entry["cache_seq_indices"] = cache_seq_indices;
     entry["logits_shape"] = std::vector<int64_t>{1, top.n_rows, top.k};
     entry["logits_dtype"] = "float32";
-    entry["backend_sampled"] = true;
+    entry["backend_sampled"] = host_topk_ == nullptr;
     entry["top_k_ids"] = top.ids;
     entry["top_k_logprobs"] = top.logprobs;
     entry["argmax_token_ids"] = argmax_ids;
@@ -494,7 +531,19 @@ LlamaCppEngine::TopKRows LlamaCppEngine::forward_batch_topk(
         }
         batch_set(i, input_ids[i], position_ids[i], seq_ids[i], /*want_logits=*/true);
     }
+
+    using Clock = std::chrono::steady_clock;
+    const auto ms_between = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const Clock::time_point t_start = Clock::now();
     decode(n);
+    const Clock::time_point t_decoded = Clock::now();
+    // Every llama_get_sampled_* call below synchronizes anyway; doing it
+    // here first gives the wait its own span instead of burying it in the
+    // first read.
+    llama_synchronize(ctx_);
+    const Clock::time_point t_synced = Clock::now();
 
     TopKRows out;
     out.k = draft_top_k_;
@@ -502,7 +551,20 @@ LlamaCppEngine::TopKRows LlamaCppEngine::forward_batch_topk(
     out.ids.resize(static_cast<size_t>(n) * draft_top_k_);
     out.logprobs.resize(static_cast<size_t>(n) * draft_top_k_);
 
-    for (int32_t i = 0; i < n; ++i) {
+    if (host_topk_) {
+        std::vector<const float*> rows(static_cast<size_t>(n));
+        for (int32_t i = 0; i < n; ++i) {
+            rows[static_cast<size_t>(i)] = llama_get_logits_ith(ctx_, i);
+            if (rows[static_cast<size_t>(i)] == nullptr) {
+                throw std::runtime_error(
+                    "forward_batch_topk: llama_get_logits_ith returned NULL for row " +
+                    std::to_string(i));
+            }
+        }
+        host_topk_->Run(rows, out.ids.data(), out.logprobs.data());
+    }
+
+    for (int32_t i = 0; i < n && !host_topk_; ++i) {
         const llama_token* candidates = llama_get_sampled_candidates_ith(ctx_, i);
         const float* probs = llama_get_sampled_probs_ith(ctx_, i);
         if (candidates == nullptr || probs == nullptr) {
@@ -526,8 +588,15 @@ LlamaCppEngine::TopKRows LlamaCppEngine::forward_batch_topk(
             out.logprobs[f] = std::log(probs[j]);
         }
     }
+    const Clock::time_point t_read = Clock::now();
 
     log_forward_topk(input_ids, position_ids, slot_indices, out);
+    const Clock::time_point t_logged = Clock::now();
+
+    last_forward_timing_.decode_ms = ms_between(t_start, t_decoded);
+    last_forward_timing_.sync_ms = ms_between(t_decoded, t_synced);
+    last_forward_timing_.readback_ms = ms_between(t_synced, t_read);
+    last_forward_timing_.log_ms = ms_between(t_read, t_logged);
     return out;
 }
 
