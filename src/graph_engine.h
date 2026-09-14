@@ -173,6 +173,16 @@ public:
     // sibling is decoded so the copied path is exactly root..parent.
     void seq_cp(int32_t src_seq_id, int32_t dst_seq_id);
 
+    // Tree mode only: drops seq_id's tag from cells at positions [p0, p1)
+    // (p1 == -1 means "to the end"). Only this seq's tag is removed -- a
+    // cell another sequence still tags survives untouched, and the
+    // sequence copied *from* is unaffected. Public alongside seq_cp so a
+    // caller that forks past seq_cp's "before the first sibling is
+    // decoded" precondition (see above) can trim a copy back down to a
+    // clean prefix afterward -- see ProactiveDraft::ChooseBet's
+    // already-decoded-leaf path.
+    void seq_rm(int32_t seq_id, int32_t p0, int32_t p1);
+
     // Tree mode only: end-of-round acceptance. Keeps only seq_id's cells at
     // positions [0, last_pos], drops every other branch (a cell whose tag
     // set empties is freed), and retags the survivors onto the canonical
@@ -236,7 +246,6 @@ private:
     void batch_set(int32_t i, llama_token token, llama_pos pos, int32_t seq_id, bool want_logits);
     void decode(int32_t n_tokens);
     std::vector<float> read_logits(int32_t n_rows) const;
-    void seq_rm(int32_t seq_id, int32_t p0, int32_t p1);
     void backfill(int32_t have, int32_t need);
     void log_forward(
         const std::vector<llama_token>& input_ids,

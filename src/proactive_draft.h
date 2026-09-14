@@ -36,19 +36,34 @@ namespace specedge {
 //    That also removes the reference's need for a second, wider sampler --
 //    the engine's existing top-k width is enough.
 //
-//  - Scoring the frontier leaves decodes them, and those cells are real.
-//    torch lets proactive.py rewrite a slot it has already written;
-//    llama.cpp would append a *second* cell at the same (seq, pos). So
-//    every leaf this scores is marked kProcessed, which is both true and
-//    what stops SpecExecClient's acceptance backfill decoding it twice.
-//    The same constraint runs the other way, which is what FrontierLeaves()
-//    enforces: a node may only be scored if it has no cell *yet*. "Childless"
-//    alone does not mean that -- a node whose children were all dropped by
-//    the budget/top-k selection is childless and already decoded -- so the
-//    frontier is taken by status, not by shape. Getting this wrong is not a
-//    silent inefficiency: llama_decode rejects the whole batch with -1
-//    ("invalid input batch", positions must satisfy Y = X + 1), which loses
-//    every bet rather than just the offending leaf.
+//  - Scoring a frontier leaf decodes it, and that cell is real. torch lets
+//    proactive.py rewrite a slot it has already written; llama.cpp would
+//    append a *second* cell at the same (seq, pos) for a leaf that already
+//    has one, which llama_decode rejects for the whole batch with -1
+//    ("invalid input batch", positions must satisfy Y = X + 1) -- losing
+//    every bet, not just the offending leaf. FrontierLeaves() is therefore
+//    shape-only again, at parity with _get_leaves_nodes: childless is
+//    sufficient. ChooseBet is what handles an already-decoded (kProcessed)
+//    childless leaf -- it forks a scratch sequence from the leaf's
+//    *parent* and decodes the leaf's own token onto that scratch sequence
+//    instead of its real one, exactly as it would for a never-decoded
+//    leaf. The parent's seq is not simply "history minus this leaf's
+//    cell": a node's first child inherits the parent's seq id outright
+//    rather than forking, so that child's descendants keep extending the
+//    same seq past the parent's position, and a *later* sibling's fork
+//    would copy those cells too -- at the sibling's own position,
+//    reproducing the identical conflict one hop removed. The fork is
+//    therefore followed by a trim: seq_rm(scratch, leaf's pos, -1) removes
+//    everything from the leaf's position onward on the copy only, leaving
+//    exactly the root..parent chain. Both calls are cheap: seq_cp is a
+//    tag-only copy and seq_rm only drops this seq's tag, under kv_unified
+//    (see graph_engine.h) -- no KV data moves and no other sequence is
+//    touched. The real leaf keeps its original seq id and status
+//    untouched throughout, so a later bet win still forks the winning
+//    branch from the leaf's true KV history. Every leaf this scores --
+//    forked or not -- is marked kProcessed on its real slot afterward,
+//    which is both true and what stops SpecExecClient's acceptance
+//    backfill from decoding it twice.
 //
 //  - Branch forks are seq_cp, as in SpecExecClient::GrowTree; the caller
 //    supplies the allocator so seq ids stay unique across both.
@@ -109,10 +124,11 @@ private:
     // Port of _get_leaves_nodes: frontier nodes of the *current* draft
     // tree, capped at max_n_beams by cumulative logprob. Absolute slots.
     //
-    // Frontier means childless *and* still kCandidate -- undecoded, so it
-    // owns no KV cell and ChooseBet may forward it. Nodes the drafter already
-    // decoded and then never extended are childless too, but they are
-    // kProcessed and must be left out (see the note above the class).
+    // Frontier means childless, full stop -- shape only, matching the
+    // Python reference. A childless node that is already kProcessed (its
+    // children were pruned by an earlier budget/top-k pass) is still
+    // forwarded; ChooseBet scores it via a scratch-sequence fork instead of
+    // excluding it (see the note above the class).
     std::vector<int32_t> FrontierLeaves() const;
 
     LlamaCppEngine& engine_;

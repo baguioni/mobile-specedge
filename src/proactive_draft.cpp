@@ -86,17 +86,11 @@ std::vector<int32_t> ProactiveDraft::FrontierLeaves() const {
 
     std::vector<int32_t> leaves;
     for (int32_t i = prefix; i < end; ++i) {
-        // Childless is not sufficient. A node whose children were all dropped
-        // by the budget/top-k selection is childless *and* already decoded, so
-        // it owns a KV cell at its own (seq, pos) -- GrowTree marks exactly
-        // those kProcessed. Forwarding one below would ask llama.cpp to append
-        // a second cell at a position the sequence already holds, which it
-        // refuses ("inconsistent sequence positions: Y = X + 1" and a -1 from
-        // llama_decode), and that failure kills the entire bet. kCandidate is
-        // the only status with no cell yet, which is precisely the set
-        // ChooseBet is allowed to forward.
-        if (!is_parent[static_cast<size_t>(i)] &&
-            tree_.status()[i] == Tree::kCandidate) {
+        // Childless is sufficient on its own now -- ChooseBet forks a
+        // scratch sequence for a leaf that already owns a KV cell
+        // (kProcessed), so scoring it a second time no longer risks a
+        // duplicate cell at the same (seq, pos). See ChooseBet.
+        if (!is_parent[static_cast<size_t>(i)]) {
             leaves.push_back(i);
         }
     }
@@ -122,9 +116,45 @@ std::optional<ProactiveDraft::Bet> ProactiveDraft::ChooseBet() {
     std::vector<llama_pos> in_pos(n);
     std::vector<int32_t> in_seqs(n);
     for (int32_t b = 0; b < n; ++b) {
-        in_tokens[b] = tree_.tokens()[leaves[b]];
-        in_pos[b] = tree_.positions()[leaves[b]];
-        in_seqs[b] = tree_.seq_ids()[leaves[b]];
+        const int32_t leaf = leaves[b];
+        in_tokens[b] = tree_.tokens()[leaf];
+        in_pos[b] = tree_.positions()[leaf];
+
+        if (tree_.status()[leaf] == Tree::kProcessed) {
+            // Already decoded: it owns a KV cell at (its own seq, its own
+            // pos), so decoding it again there would append a duplicate.
+            // Fork from its *parent* instead and let the decode below
+            // recreate that cell fresh on a scratch sequence, exactly as
+            // it would for a never-decoded leaf.
+            //
+            // The parent's seq is not simply "history minus this leaf's
+            // cell", though: a node's *first* child inherits the parent's
+            // seq id outright rather than forking (see tree.h), so that
+            // child's own descendants keep extending the *same* seq id
+            // past the parent's position. If a sibling of `leaf` took
+            // that slot, the parent's current seq already carries cells
+            // at leaf's position (and beyond) that belong to the
+            // sibling's spine, not to `leaf`. Copying it as-is would
+            // recreate the exact conflict one hop removed: llama_decode
+            // rejects a duplicate cell on the copy too.
+            //
+            // seq_rm(scratch, leaf's pos, -1) after the copy strips
+            // everything from the leaf's own position onward *on the
+            // copy only* -- it removes this seq's tag, the original
+            // cells and every other sequence are untouched -- leaving
+            // exactly the root..parent chain, nothing borrowed from a
+            // sibling. seq_cp is a tag-only copy under kv_unified (see
+            // graph_engine.h), so both calls cost no KV data movement.
+            // The leaf's real seq id is untouched throughout, so a later
+            // bet win still forks the winning branch from its true
+            // history.
+            const int32_t scratch_seq = alloc_seq_();
+            engine_.seq_cp(tree_.seq_ids()[tree_.parents()[leaf]], scratch_seq);
+            engine_.seq_rm(scratch_seq, in_pos[b], -1);
+            in_seqs[b] = scratch_seq;
+        } else {
+            in_seqs[b] = tree_.seq_ids()[leaf];
+        }
     }
 
     const LlamaCppEngine::TopKRows top =

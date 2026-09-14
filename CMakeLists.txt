@@ -106,9 +106,37 @@ target_link_libraries(client PRIVATE graph_engine_lib yaml-cpp::yaml-cpp llama-c
 # default: -DSPECEDGE_BUILD_TESTS=ON, then ./build/tree_splice_test.
 option(SPECEDGE_BUILD_TESTS "Build the unit tests" OFF)
 if(SPECEDGE_BUILD_TESTS)
-  add_executable(tree_splice_test src/test/tree_splice_test.cpp src/tree.cpp)
-  target_include_directories(tree_splice_test PRIVATE src)
-  target_link_libraries(tree_splice_test PRIVATE llama)
+  # Guarded by EXISTS: this file is referenced but not present in this
+  # checkout, and SPECEDGE_BUILD_TESTS should not fail to configure over a
+  # test that isn't there rather than one that is broken.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/test/tree_splice_test.cpp")
+    add_executable(tree_splice_test src/test/tree_splice_test.cpp src/tree.cpp)
+    target_include_directories(tree_splice_test PRIVATE src)
+    target_link_libraries(tree_splice_test PRIVATE llama)
+    enable_testing()
+    add_test(NAME tree_splice COMMAND tree_splice_test)
+  endif()
+
+  # Tier-2 sandbox for ProactiveDraft's frontier-leaf fix (see
+  # src/proactive_draft.cpp's FrontierLeaves/ChooseBet and
+  # src/test/proactive_draft_test.cpp): a real LlamaCppEngine + GGUF model,
+  # proving llama.cpp's KV cache tolerates ChooseBet's scratch-fork path.
+  # Deliberately built from the leanest source set that provides
+  # LlamaCppEngine -- graph_engine.cpp only needs nlohmann_json and llama,
+  # not gRPC/protobuf/yaml-cpp -- rather than linking graph_engine_lib
+  # (which pulls in the gRPC client/server plumbing this test never uses).
+  add_executable(proactive_draft_test
+    src/test/proactive_draft_test.cpp
+    src/graph_engine.cpp
+    src/host_topk.cpp
+    src/topk_sampler.cpp
+    src/tree.cpp
+    src/proactive_draft.cpp
+  )
+  target_include_directories(proactive_draft_test PRIVATE src)
+  target_link_libraries(proactive_draft_test PRIVATE llama nlohmann_json::nlohmann_json)
+  target_compile_definitions(proactive_draft_test PRIVATE
+    PROACTIVE_DRAFT_TEST_MODEL_PATH="${CMAKE_SOURCE_DIR}/models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf")
   enable_testing()
-  add_test(NAME tree_splice COMMAND tree_splice_test)
+  add_test(NAME proactive_draft COMMAND proactive_draft_test)
 endif()
