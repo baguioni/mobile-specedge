@@ -10,10 +10,14 @@ endif()
 include(FetchContent)
 
 # Pin to a released tag so builds are reproducible; bump deliberately.
+# 5202104b5 (2026-09-07): picks up ~10 ggml-hexagon commits over b10615
+# (f280b2698), including the fully-async HTP backend (#26501) and MUL_MAT
+# fusion (#28202) -- see mobile-specedge/experiments/09-11-26/npu-host-topk-results.md
+# for the ~1.6x draft-round speedup this was already measured to give.
 FetchContent_Declare(
   llama_cpp
 GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-GIT_TAG        b10615
+GIT_TAG        5202104b59ada9005db079eea43882a2b7bf5802
 GIT_SHALLOW    TRUE
 )
 
