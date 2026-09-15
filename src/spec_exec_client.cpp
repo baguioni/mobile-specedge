@@ -822,21 +822,27 @@ std::vector<llama_token> SpecExecClient::ValidateTree(
         // and retag onto seq 0. Cells never move.
         const int32_t keep_seq = tree_.seq_ids()[last_slot];
         const llama_pos last_pos = tree_.positions()[last_slot];
-        // kCandidate here means "never decoded". A leaf the proactive draft
-        // scored is kProcessed by now precisely so this does not decode it
-        // a second time -- llama.cpp would append a duplicate cell at the
-        // same (seq, pos) rather than overwrite.
-        const bool tip_undecoded = tree_.status()[last_slot] == Tree::kCandidate;
         const llama_token tip_token = tree_.tokens()[last_slot];
 
-        engine_.collapse_to_seq(keep_seq, tip_undecoded ? last_pos - 1 : last_pos);
-        if (tip_undecoded) {
-            // The deepest accepted node was a frontier CANDIDATE the draft
-            // engine never decoded; close the gap so next round's seed
-            // attends to a complete prefix (the tree analogue of linear
-            // backfill()).
-            engine_.decode_token(tip_token, last_pos, /*seq_id=*/0);
-        }
+        // Always redo the accepted tip's own cell solo, even if a proactive
+        // bet already decoded it this round (status kProcessed). That
+        // earlier decode ran batched with every other scored frontier leaf
+        // (ChooseBet's forward_batch_topk, up to max_n_beams rows at once);
+        // batched matmul reduction order is not guaranteed bit-identical to
+        // a solo decode of the same (token, position, history), and this
+        // node is the seed the whole next round's draft attends from, so
+        // that drift has outsized leverage. Confirmed empirically on-device
+        // (NPU replay): reusing the batched value made per-request accepted
+        // -token counts start diverging from a proactive-disabled run
+        // exactly one round after proactive's first attempt, always down or
+        // flat, never up (a fixed replay reference can only be missed by
+        // noise, never helped by it). collapse_to_seq(..., last_pos - 1)
+        // drops that cell -- proactively-computed or never-decoded, either
+        // way -- and decode_token always redoes it fresh on seq 0, trading
+        // one cheap extra single-token decode per proactive-miss round for
+        // matching the non-proactive numeric path exactly.
+        engine_.collapse_to_seq(keep_seq, last_pos - 1);
+        engine_.decode_token(tip_token, last_pos, /*seq_id=*/0);
 
         tree_.reorder_by_sequence(seq_mask);
 
