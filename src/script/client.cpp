@@ -83,7 +83,17 @@ struct ClientConfig {
     // Where the draft's log-softmax + top-k runs: "backend" (a sampler in
     // the decode graph, topk_sampler.h) or "host" (HostTopK over the raw
     // logits, host_topk.h). See LlamaCppEngine::Config::host_topk.
-    std::string draft_scoring = "backend";
+    //
+    // Default is "host": the backend path's ggml_top_k has no ordering
+    // guarantee (ggml-cpu deliberately swaps its first two output slots --
+    // see ggml_compute_forward_top_k_f32 -- and OpenCL/Hexagon have no
+    // TOP_K kernel at all, so they fall back to that same CPU op), while
+    // ProactiveDraft::ChooseBet reads row index 0 assuming it is the best
+    // candidate. On the backend path that assumption does not hold, so
+    // ChooseBet can bet on the wrong token. host_topk's HostTopK::Run()
+    // genuinely sorts its output, and benchmarked faster on-device at the
+    // repo's configured n_rows=32/draft_top_k=16 besides.
+    std::string draft_scoring = "host";
 
     // target + decoding (SpecExec drafting parameters, see
     // spec_exec_client.h)
