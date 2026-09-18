@@ -195,11 +195,29 @@ public:
     // already-decoded-leaf path.
     void seq_rm(int32_t seq_id, int32_t p0, int32_t p1);
 
+    // Tree mode only: end-of-round acceptance of a non-proactive round.
+    // path_tokens/path_positions run from the round's seed (the last
+    // committed token, decoded as the tree root) through the deepest
+    // accepted node, which sits on keep_seq. Afterwards seq 0 holds exactly
+    // prompt + path and every draft branch is gone.
+    //
+    // Plain-attention models: collapse_to_seq(keep_seq, tip - 1), then the
+    // tip re-decoded solo on seq 0. Recurrent/hybrid models (recurrent()):
+    // a recurrent state cannot be rewound past what the draft decoded on top
+    // of it, so every branch is dropped and the path is re-decoded in one
+    // batch onto a hidden sequence that only ever holds committed state,
+    // which seq 0 then shares.
+    void accept_path(
+        int32_t keep_seq,
+        const std::vector<llama_token>& path_tokens,
+        const std::vector<llama_pos>& path_positions);
+
     // Tree mode only: end-of-round acceptance. Keeps only seq_id's cells at
     // positions [0, last_pos], drops every other branch (a cell whose tag
     // set empties is freed), and retags the survivors onto the canonical
     // seq 0 -- the seq_rm/seq_keep/seq_cp/seq_keep pattern of
-    // examples/speculative/speculative.cpp. Cells never move.
+    // examples/speculative/speculative.cpp. Cells never move. Not available
+    // on recurrent models, which cannot truncate by position.
     void collapse_to_seq(int32_t seq_id, llama_pos last_pos);
 
     // Tree mode only: end-of-round acceptance when a proactive subtree
@@ -241,6 +259,11 @@ public:
     int32_t seq_len() const { return seq_len_; }
     int32_t max_seqs() const { return max_seqs_; }
     bool tree_mode() const { return tree_mode_; }
+    // The model keeps recurrent state (Mamba, Gated DeltaNet, ...), alone or
+    // alongside attention layers as in Qwen3.5. Such a sequence can only move
+    // forward: partial seq_rm is unsupported, so acceptance goes through
+    // accept_path()'s re-decode and proactive drafting is unavailable.
+    bool recurrent() const { return recurrent_; }
     // The attached sampler's k. Callers index forward_batch_topk()'s rows
     // against this, so it must match their branch width.
     int32_t draft_top_k() const { return draft_top_k_; }
@@ -288,6 +311,11 @@ private:
     // Set instead of samplers_ when Config::host_topk is.
     std::unique_ptr<HostTopK> host_topk_;
     bool tree_mode_ = false;
+    bool recurrent_ = false;
+    // Tree mode on a recurrent model: the llama.cpp sequence holding only
+    // committed state (== max_seqs_, one past every caller-visible seq id).
+    // -1 otherwise.
+    int32_t committed_seq_ = -1;
 
     int32_t seq_len_ = 0;
     // (position, predicted_token) for the bonus token the draft model

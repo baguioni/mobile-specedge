@@ -204,13 +204,27 @@ void LlamaCppEngine::load_model(const Config& config) {
     n_vocab_ = llama_vocab_n_tokens(vocab_);
     check_vocab_parity(config.expected_vocab_size);
 
+    recurrent_ = llama_model_is_recurrent(model_) || llama_model_is_hybrid(model_);
+
     // Linear mode drives a single llama.cpp sequence (seq_id 0). Tree mode
     // needs one sequence per concurrent draft branch, and a *unified* KV
     // buffer: with kv_unified = true all sequences share one cell pool
     // (n_ctx cells total, not divided per sequence), a cell can carry
     // several seq tags, and llama_memory_seq_cp is a tag-only copy -- the
     // whole basis of the branch-fork scheme (see seq_cp()).
-    const int32_t n_seq_max = max_seqs_;
+    //
+    // A recurrent model in tree mode gets one more, hidden sequence for its
+    // committed state (see accept_path()). It comes out of the draft's share
+    // when max_seqs is already at llama.cpp's cap.
+    if (tree_mode_ && recurrent_) {
+        if (max_seqs_ == 256) {
+            max_seqs_ = 255;
+            log_info("Recurrent model: max_seqs lowered 256 -> 255 to fit the "
+                     "committed-state sequence under llama.cpp's 256 cap");
+        }
+        committed_seq_ = max_seqs_;
+    }
+    const int32_t n_seq_max = committed_seq_ >= 0 ? max_seqs_ + 1 : max_seqs_;
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = static_cast<uint32_t>(max_len_);
@@ -296,8 +310,9 @@ void LlamaCppEngine::load_model(const Config& config) {
 
     log_info(
         "llama.cpp context ready: n_ctx=%u n_ctx_seq=%u n_batch=%d "
-        "n_seq_max=%d n_vocab=%d",
-        ctx_params.n_ctx, n_ctx_seq, n_batch_, n_seq_max, n_vocab_);
+        "n_seq_max=%d n_vocab=%d recurrent=%d",
+        ctx_params.n_ctx, n_ctx_seq, n_batch_, n_seq_max, n_vocab_,
+        recurrent_ ? 1 : 0);
 }
 
 void LlamaCppEngine::check_vocab_parity(std::optional<int32_t> expected_vocab_size) const {
@@ -632,8 +647,63 @@ void LlamaCppEngine::seq_cp(int32_t src_seq_id, int32_t dst_seq_id) {
     llama_memory_seq_cp(memory_, src_seq_id, dst_seq_id, -1, -1);
 }
 
+void LlamaCppEngine::accept_path(
+    int32_t keep_seq,
+    const std::vector<llama_token>& path_tokens,
+    const std::vector<llama_pos>& path_positions) {
+    require_mode(/*tree=*/true, "accept_path");
+    if (path_tokens.empty() || path_tokens.size() != path_positions.size()) {
+        throw std::invalid_argument(
+            "accept_path: needs a non-empty path with one position per token");
+    }
+    const llama_pos tip_pos = path_positions.back();
+
+    if (committed_seq_ < 0) {
+        // Redo the tip solo even if the draft already decoded it: see the
+        // proactive-miss comment in SpecExecClient::ValidateTree.
+        collapse_to_seq(keep_seq, tip_pos - 1);
+        decode_token(path_tokens.back(), tip_pos, /*seq_id=*/0);
+        return;
+    }
+
+    const int32_t n = static_cast<int32_t>(path_tokens.size());
+    if (n > n_batch_) {
+        throw std::invalid_argument(
+            "accept_path: " + std::to_string(n) + " tokens exceeds n_batch=" +
+            std::to_string(n_batch_));
+    }
+    for (int32_t i = 1; i < n; ++i) {
+        if (path_positions[i] != path_positions[i - 1] + 1) {
+            throw std::invalid_argument("accept_path: path positions are not consecutive");
+        }
+    }
+
+    // Every draft branch, seq 0's included, holds state past the seed that
+    // cannot be partially undone. Drop them all; the committed sequence is
+    // untouched by drafting and still ends just before the seed.
+    for (int32_t s = 0; s < max_seqs_; ++s) {
+        llama_memory_seq_rm(memory_, s, -1, -1);
+    }
+    for (int32_t i = 0; i < n; ++i) {
+        batch_set(i, path_tokens[i], path_positions[i], committed_seq_,
+                  /*want_logits=*/i == n - 1);
+    }
+    decode(n);
+    // Share it as seq 0, the next round's root. The recurrent cell is
+    // copied on seq 0's first decode, so drafting never writes into it.
+    llama_memory_seq_cp(memory_, committed_seq_, 0, -1, -1);
+
+    seq_len_ = tip_pos + 1;
+    predicted_.reset();
+}
+
 void LlamaCppEngine::collapse_to_seq(int32_t seq_id, llama_pos last_pos) {
     require_mode(/*tree=*/true, "collapse_to_seq");
+    if (recurrent_) {
+        throw std::logic_error(
+            "collapse_to_seq: a recurrent model cannot truncate a sequence by "
+            "position; use accept_path()");
+    }
     if (seq_id < 0 || seq_id >= max_seqs_) {
         throw std::invalid_argument(
             "collapse_to_seq: seq_id " + std::to_string(seq_id) +
@@ -729,6 +799,13 @@ void LlamaCppEngine::prefill(
     seq_len_ = 0;
     predicted_.reset();
 
+    // Recurrent tree mode commits the prompt to the hidden committed-state
+    // sequence and shares it as seq 0 (see accept_path()).
+    const int32_t target_seq = committed_seq_ >= 0 ? committed_seq_ : 0;
+    if (committed_seq_ >= 0) {
+        seq_rm(committed_seq_, -1, -1);
+    }
+
     // The last prompt token belongs to the first forward(), not to prefill.
     // n_tokens is 0 when the prompt is a single token, which correctly
     // commits nothing.
@@ -743,10 +820,13 @@ void LlamaCppEngine::prefill(
             // but llama.cpp's own batch decode path always marks the final
             // token of a decode, so a chunk with zero requested outputs is
             // off the tested path.
-            batch_set(i, input_ids[idx], position_ids[idx], /*seq_id=*/0,
+            batch_set(i, input_ids[idx], position_ids[idx], target_seq,
                       /*want_logits=*/idx == stop - 1);
         }
         decode(stop - start);
+    }
+    if (committed_seq_ >= 0) {
+        llama_memory_seq_cp(memory_, committed_seq_, 0, -1, -1);
     }
 
     seq_len_ = n_tokens;
@@ -848,6 +928,11 @@ void LlamaCppEngine::gather(
     if (n_keep > seq_len_) {
         backfill(seq_len_, n_keep);
     } else if (n_keep < seq_len_) {
+        if (recurrent_) {
+            throw std::logic_error(
+                "gather: a recurrent model cannot drop the last " +
+                std::to_string(seq_len_ - n_keep) + " decoded tokens");
+        }
         seq_rm(0, n_keep, -1);
     }
 

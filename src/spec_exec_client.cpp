@@ -165,6 +165,15 @@ SpecExecClient::SpecExecClient(
     RebuildSeqPool();
 
     if (config_.proactive_type != ProactiveType::kDisabled) {
+        // ChooseBet trims forked sequences by position and a hit keeps the
+        // subtree's sequences in place of a committed one; neither works on
+        // a state that can only move forward.
+        if (engine_.recurrent()) {
+            throw std::invalid_argument(
+                "SpecExecClient: proactive drafting is not supported on a "
+                "recurrent/hybrid draft model (e.g. Qwen3.5); set "
+                "proactive.type: disabled.");
+        }
         if (config_.proactive_type == ProactiveType::kIncluded &&
             config_.proactive.max_beam_len >= config_.max_beam_len) {
             throw std::invalid_argument(
@@ -821,8 +830,16 @@ std::vector<llama_token> SpecExecClient::ValidateTree(
         // it), drop everything else -- a losing bet's branches included --
         // and retag onto seq 0. Cells never move.
         const int32_t keep_seq = tree_.seq_ids()[last_slot];
-        const llama_pos last_pos = tree_.positions()[last_slot];
-        const llama_token tip_token = tree_.tokens()[last_slot];
+
+        // Seed (last committed token, the tree root) through the tip. The
+        // engine re-decodes all of it on a recurrent model, only the tip on
+        // an attention-only one.
+        std::vector<llama_token> path_tokens{tree_.tokens()[prefix - 1]};
+        std::vector<llama_pos> path_positions{tree_.positions()[prefix - 1]};
+        for (int32_t s : fresh_slots) {
+            path_tokens.push_back(tree_.tokens()[s]);
+            path_positions.push_back(tree_.positions()[s]);
+        }
 
         // Always redo the accepted tip's own cell solo, even if a proactive
         // bet already decoded it this round (status kProcessed). That
@@ -836,13 +853,12 @@ std::vector<llama_token> SpecExecClient::ValidateTree(
         // -token counts start diverging from a proactive-disabled run
         // exactly one round after proactive's first attempt, always down or
         // flat, never up (a fixed replay reference can only be missed by
-        // noise, never helped by it). collapse_to_seq(..., last_pos - 1)
-        // drops that cell -- proactively-computed or never-decoded, either
-        // way -- and decode_token always redoes it fresh on seq 0, trading
+        // noise, never helped by it). accept_path drops that cell --
+        // proactively-computed or never-decoded, either way -- and always
+        // redoes it fresh on seq 0, trading
         // one cheap extra single-token decode per proactive-miss round for
         // matching the non-proactive numeric path exactly.
-        engine_.collapse_to_seq(keep_seq, last_pos - 1);
-        engine_.decode_token(tip_token, last_pos, /*seq_id=*/0);
+        engine_.accept_path(keep_seq, path_tokens, path_positions);
 
         tree_.reorder_by_sequence(seq_mask);
 

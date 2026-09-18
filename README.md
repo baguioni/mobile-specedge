@@ -28,7 +28,7 @@ anything here.
 | `src/spec_exec_client.{h,cpp}` | `SpecExecClient` — the draft + verify round loop (port of `specexec.py`). |
 | `src/proactive_draft.{h,cpp}` | `ProactiveDraft` — bets on the bonus token and pre-grows next round's tree inside the `Validate` round-trip (port of `proactive.py`). |
 | `src/script/client.cpp` | → `client` binary. Config-driven batch run over a dataset against a target server. |
-| `src/local_test.cpp` | → `local_test` binary. Offline smoke test: prefill one prompt, greedily decode a few tokens through `LlamaCppEngine` (linear mode), print the completion. No target server. |
+| `src/local_test.cpp` | → `local_test` binary. Offline smoke test: a linear greedy decode, a tree-mode commit exactness check, and a `SpecExecClient` run against an in-process oracle. No target server. |
 | `src/config.h` | Env-var config reader kept for parity with the Python launcher. **Not used by any current binary.** |
 | `src/metric/mobile.py` | Post-run latency/throughput analysis of the JSONL result logs. |
 | `src/test/` | Unit tests; build with `-DSPECEDGE_BUILD_TESTS=ON`. |
@@ -281,28 +281,53 @@ run the binary **from the project root**.
 
 The large model runs on the target server and is configured there, not here.
 
+Hybrid drafts such as `models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_0.gguf` work
+too. Qwen3.5 interleaves Gated DeltaNet layers, whose recurrent state can't be
+rewound to drop rejected draft tokens. For these models the engine keeps one
+extra hidden llama.cpp sequence with only committed state. At the end of each
+round it re-decodes the seed plus the accepted tokens onto that sequence, at
+most `max_beam_len + 1` tokens in one batch. Two consequences: proactive
+drafting is refused, and the recurrent-state buffer grows with `max_seqs + 1`
+(about 19 MB per sequence for the 0.8B). The target must be the matching
+Qwen3.5 model, because its vocabulary (248k) differs from Qwen3's.
+
 ---
 
 ## Running
 
 ### `local_test` — offline smoke test
 
-No target server, no gRPC. Loads a GGUF draft model into `LlamaCppEngine` in
-linear mode, prefills a prompt, greedily decodes a few tokens through
-`forward()`, exercises `gather()`/`reset()`, and prints the completion. Use it
-to confirm the llama.cpp build links and runs on this machine before wiring up
-a target.
+No target server, no gRPC. Use it to confirm the llama.cpp build links and
+that a draft model runs on this machine before wiring up a target. It has
+three sections, and exits non-zero if any fails:
+
+- **linear**: prefills a prompt, greedily decodes a few tokens through
+  `forward()`, and exercises `gather()`/`reset()`.
+- **commit check** (tree): drives the tree engine through rounds that leave
+  rejected draft tokens behind (on the winning branch, on forks, and past the
+  tip). After every `accept_path()` it compares the next prediction with a
+  linear engine that only decoded the committed tokens.
+- **tree**: the real `SpecExecClient` against an in-process `OracleValidator`
+  that judges each round against `--reference`, so rounds accept partially.
 
 ```sh
-./build/local_test --prompt "The capital of France is" --n-generate 12
-# Prompt: The capital of France is
-# Completion:  Paris, and the capital of Italy is Rome. The capital
+./build/local_test --model models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_0.gguf --flash-attn 0
+# Completion:  Paris.
+# Commit check: 25/25 rounds pass, max |d logprob| = 0.0438, same top-1 in 23/25
+# Tree: 21 rounds, 56 tokens committed, 2.67 per round (max 4)
 ```
+
+The linear and tree engines use different kernels, so small log-prob drift
+and top-1 swaps at near-ties are expected. Qwen3-0.6B drifts by up to ~0.11,
+and the check allows 0.25. One corrupted committed token drops it to about
+6/25.
 
 | Flag | Meaning |
 |------|---------|
 | `--model <path>` | GGUF model path (default `models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_0.gguf`) |
+| `--mode <linear\|tree\|all>` | sections to run (default `all`; `tree` covers the commit check and the tree run) |
 | `--prompt <text>` | prompt to complete (default `"The capital of France is"`) |
+| `--reference <text>` | tree sections: continuation the oracle judges against |
 | `--max-len <n>` | context / `max_len` passed to `LlamaCppEngine` (default 256) |
 | `--n-generate <n>` | tokens to greedily decode (default 8) |
 | `--n-gpu-layers <n>` | layers to offload to GPU, `-1` for all (default 0) |
@@ -378,6 +403,10 @@ logs what it needs to size it:
 
 A hit rate near zero, or `proactive_ms` well over `client_wait`, means the
 setting is costing more than it returns.
+
+Proactive drafting needs attention-only draft models. With a hybrid draft like
+Qwen3.5 the client refuses to start unless `proactive.type: disabled` (see
+[Models](#models)).
 
 ---
 

@@ -34,9 +34,10 @@ namespace specedge {
 //      * TrimByBudget touches only the Tree's slots (the wire contract
 //        needs draft slots contiguous); pruned branches' KV cells are
 //        dropped wholesale by the end-of-round collapse;
-//      * acceptance is collapse_to_seq (keep the winning branch, retag it
-//        onto seq 0) plus a one-token backfill when the deepest accepted
-//        node is a never-decoded CANDIDATE leaf, instead of a gather.
+//      * acceptance is LlamaCppEngine::accept_path instead of a gather:
+//        keep the winning branch, retag it onto seq 0 and redo the tip --
+//        or, on a recurrent/hybrid model, re-decode the accepted path onto
+//        a committed-only sequence, since recurrent state can't be rewound.
 //  - EOS uses llama_vocab_is_eog() instead of a single eos_token_id check,
 //    same as the former linear client.
 //  - No asyncio: the Validate RPC is moved to a std::async worker so the

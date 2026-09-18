@@ -1,0 +1,36 @@
+## CPU variant, Qwen3.5-0.8B draft, proactive off.
+## flash_attn: false -- CPU: FA hurts decode-at-depth (mobile-benchmarks finding).
+client:
+  result_path: "result/"
+  exp_name: "mobile-qwen35-cpu"
+  draft_model: models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_0.gguf
+  n_gpu_layers: 0    # CPU-only: no-op, kept for clarity
+  main_gpu: 0
+  single_gpu: true
+  n_threads: 6
+  n_threads_batch: 6
+  flash_attn: false  # CPU: FA hurts decode-at-depth (mobile-benchmarks finding)
+  host: 202.122.49.242:17599
+  dtype: fp16
+  max_len: 2048
+  max_n_beams: 4
+  max_beam_len: 2
+  max_branch_width: 4
+  max_budget: 16
+  max_seqs: 32       # explicit cap -- do not leave null (derives to 256)
+
+  proactive:
+    type: disabled
+    max_n_beams: 4
+    max_beam_len: 2
+    max_branch_width: 4
+    max_budget: 16
+
+  max_new_tokens: 64
+  client_idx: 0
+
+  dataset: specbench
+  reasoning: false
+  max_request_num: -1
+  req_offset: 0
+  sample_req_cnt: 240
