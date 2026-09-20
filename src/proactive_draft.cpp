@@ -84,15 +84,33 @@ std::vector<int32_t> ProactiveDraft::FrontierLeaves() const {
         }
     }
 
+    // ChooseBet rescues an already-decoded (kProcessed) childless leaf by
+    // forking its parent's sequence and trimming the copy back to the leaf's
+    // own position. That trim is a rewind, which a recurrent state cannot do
+    // (graph_engine.h), so on those models a kProcessed leaf is simply not
+    // bettable and is left out of the frontier here.
+    //
+    // Nothing is lost that matters: an *unprocessed* leaf needs no fork at
+    // all. Its own sequence already ends exactly at its parent -- a first
+    // child inherits the parent's sequence outright and a later sibling is
+    // forked from it at add time, before any child of that parent has been
+    // decoded -- so the leaf's token decodes onto it directly, correctly, on
+    // a recurrent model as much as an attention one. The deepest level of a
+    // finished draft tree is all unprocessed, so this keeps the bets that the
+    // budget actually left on the table while dropping only the re-scores
+    // that would need a rewind. It is also strictly cheaper: a recurrent fork
+    // copies the whole ~19 MiB state rather than retagging cells.
+    const bool no_rescore = engine_.recurrent();
+
     std::vector<int32_t> leaves;
     for (int32_t i = prefix; i < end; ++i) {
-        // Childless is sufficient on its own now -- ChooseBet forks a
-        // scratch sequence for a leaf that already owns a KV cell
-        // (kProcessed), so scoring it a second time no longer risks a
-        // duplicate cell at the same (seq, pos). See ChooseBet.
-        if (!is_parent[static_cast<size_t>(i)]) {
-            leaves.push_back(i);
+        if (is_parent[static_cast<size_t>(i)]) {
+            continue;
         }
+        if (no_rescore && tree_.status()[i] == Tree::kProcessed) {
+            continue;
+        }
+        leaves.push_back(i);
     }
 
     if (static_cast<int32_t>(leaves.size()) > config_.max_n_beams) {

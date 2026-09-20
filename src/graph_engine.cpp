@@ -666,34 +666,52 @@ void LlamaCppEngine::accept_path(
         return;
     }
 
-    const int32_t n = static_cast<int32_t>(path_tokens.size());
-    if (n > n_batch_) {
-        throw std::invalid_argument(
-            "accept_path: " + std::to_string(n) + " tokens exceeds n_batch=" +
-            std::to_string(n_batch_));
-    }
-    for (int32_t i = 1; i < n; ++i) {
-        if (path_positions[i] != path_positions[i - 1] + 1) {
-            throw std::invalid_argument("accept_path: path positions are not consecutive");
-        }
-    }
-
     // Every draft branch, seq 0's included, holds state past the seed that
     // cannot be partially undone. Drop them all; the committed sequence is
     // untouched by drafting and still ends just before the seed.
     for (int32_t s = 0; s < max_seqs_; ++s) {
         llama_memory_seq_rm(memory_, s, -1, -1);
     }
-    for (int32_t i = 0; i < n; ++i) {
-        batch_set(i, path_tokens[i], path_positions[i], committed_seq_,
-                  /*want_logits=*/i == n - 1);
-    }
-    decode(n);
+    advance_committed(path_tokens, path_positions);
     // Share it as seq 0, the next round's root. The recurrent cell is
     // copied on seq 0's first decode, so drafting never writes into it.
     llama_memory_seq_cp(memory_, committed_seq_, 0, -1, -1);
 
     seq_len_ = tip_pos + 1;
+    predicted_.reset();
+}
+
+void LlamaCppEngine::advance_committed(
+    const std::vector<llama_token>& path_tokens,
+    const std::vector<llama_pos>& path_positions) {
+    require_mode(/*tree=*/true, "advance_committed");
+    if (committed_seq_ < 0) {
+        throw std::logic_error(
+            "advance_committed: no committed sequence; this engine is not recurrent");
+    }
+    if (path_tokens.empty() || path_tokens.size() != path_positions.size()) {
+        throw std::invalid_argument(
+            "advance_committed: needs a non-empty path with one position per token");
+    }
+
+    const int32_t n = static_cast<int32_t>(path_tokens.size());
+    if (n > n_batch_) {
+        throw std::invalid_argument(
+            "advance_committed: " + std::to_string(n) + " tokens exceeds n_batch=" +
+            std::to_string(n_batch_));
+    }
+    for (int32_t i = 1; i < n; ++i) {
+        if (path_positions[i] != path_positions[i - 1] + 1) {
+            throw std::invalid_argument(
+                "advance_committed: path positions are not consecutive");
+        }
+    }
+
+    for (int32_t i = 0; i < n; ++i) {
+        batch_set(i, path_tokens[i], path_positions[i], committed_seq_,
+                  /*want_logits=*/i == n - 1);
+    }
+    decode(n);
     predicted_.reset();
 }
 

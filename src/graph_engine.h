@@ -212,6 +212,28 @@ public:
         const std::vector<llama_token>& path_tokens,
         const std::vector<llama_pos>& path_positions);
 
+    // Tree mode, recurrent models only: advance the hidden committed
+    // sequence over path_tokens without touching any draft branch.
+    //
+    // accept_path() is the non-proactive end of round: it drops every draft
+    // branch first, because on a miss none of them holds usable state. A
+    // proactive *hit* is the opposite case -- the subtree's branches carry
+    // exactly the right history (the bet named the deepest accepted node and
+    // the bonus token that followed it, so everything decoded onto them
+    // really happened) and must survive. Only the committed sequence is
+    // stale: it still ends just before this round's seed, while the next
+    // round's seed is the bonus token.
+    //
+    // So this re-decodes seed-through-accepted-tip onto committed_seq_ alone,
+    // restoring the "committed ends one token before the seed" invariant that
+    // accept_path relies on next round, and leaves the branches and seq 0
+    // as they are. The caller collapses to the surviving branches afterwards;
+    // collapse_to_seqs never touches committed_seq_, which lives at
+    // max_seqs_, one past every allocatable branch.
+    void advance_committed(
+        const std::vector<llama_token>& path_tokens,
+        const std::vector<llama_pos>& path_positions);
+
     // Tree mode only: end-of-round acceptance. Keeps only seq_id's cells at
     // positions [0, last_pos], drops every other branch (a cell whose tag
     // set empties is freed), and retags the survivors onto the canonical

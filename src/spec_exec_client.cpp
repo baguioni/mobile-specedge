@@ -165,15 +165,11 @@ SpecExecClient::SpecExecClient(
     RebuildSeqPool();
 
     if (config_.proactive_type != ProactiveType::kDisabled) {
-        // ChooseBet trims forked sequences by position and a hit keeps the
-        // subtree's sequences in place of a committed one; neither works on
-        // a state that can only move forward.
-        if (engine_.recurrent()) {
-            throw std::invalid_argument(
-                "SpecExecClient: proactive drafting is not supported on a "
-                "recurrent/hybrid draft model (e.g. Qwen3.5); set "
-                "proactive.type: disabled.");
-        }
+        // Recurrent/hybrid draft models are supported, by never rewinding:
+        // ProactiveDraft::FrontierLeaves drops already-decoded leaves rather
+        // than forking and trimming a copy back to them, and the hit path in
+        // ValidateTree advances the committed sequence forward over the
+        // accepted path instead of promoting a branch in its place.
         if (config_.proactive_type == ProactiveType::kIncluded &&
             config_.proactive.max_beam_len >= config_.max_beam_len) {
             throw std::invalid_argument(
@@ -818,6 +814,24 @@ std::vector<llama_token> SpecExecClient::ValidateTree(
         // draft decoded the winning leaf when it scored it, and decoded the
         // bonus token when it grew the subtree's first level.
         const int32_t committed_len = static_cast<int32_t>(fresh_tokens.size()) + prefix + 1;
+
+        // On a recurrent model the surviving branches are fine -- the bet was
+        // right, so everything decoded onto them is real history -- but the
+        // hidden committed sequence is not: it still ends one token before
+        // this round's seed, while next round's seed is the bonus token. Walk
+        // it forward over seed..accepted-tip so accept_path's invariant holds
+        // whenever the next round turns out to be a miss. collapse_to_seqs
+        // below leaves committed_seq_ alone, so the order does not matter.
+        if (engine_.recurrent()) {
+            std::vector<llama_token> path_tokens{tree_.tokens()[prefix - 1]};
+            std::vector<llama_pos> path_positions{tree_.positions()[prefix - 1]};
+            for (int32_t s : fresh_slots) {
+                path_tokens.push_back(tree_.tokens()[s]);
+                path_positions.push_back(tree_.positions()[s]);
+            }
+            engine_.advance_committed(path_tokens, path_positions);
+        }
+
         engine_.collapse_to_seqs(bet->seq_ids, committed_len);
         tree_.reorder_by_sequence_proactive(
             seq_mask, bet->begin, bet->end, bet->root_seq_id);
