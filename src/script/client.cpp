@@ -383,7 +383,11 @@ public:
         record["output_tokens"] = output_tokens;
 
         records_[req_idx] = record;
-        jsonl_ << record.dump() << "\n";
+        // A draft/target mismatch can decode to invalid UTF-8 (mangled
+        // multi-byte sequences); nlohmann's default dump() throws on that
+        // and would abort the whole run over one bad request. Replace
+        // instead, matching spec_exec_client.cpp's per-round result log.
+        jsonl_ << record.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) << "\n";
         jsonl_.flush();
     }
 
@@ -414,13 +418,16 @@ private:
     }
 
     // json.dumps() puts ", " between list elements; dump() puts ",".
+    // Same invalid-UTF-8-output rationale as TraceWriter::Add()'s dump():
+    // replace rather than throw.
     static std::string Render(const nlohmann::ordered_json& value) {
         if (!value.is_array()) {
-            return value.dump();
+            return value.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
         }
         std::string out = "[";
         for (size_t i = 0; i < value.size(); ++i) {
-            out += (i ? ", " : "") + value[i].dump();
+            out += (i ? ", " : "") +
+                   value[i].dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
         }
         return out + "]";
     }
