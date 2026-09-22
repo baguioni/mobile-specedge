@@ -137,6 +137,12 @@ public:
     // its log-probability under the *full* vocabulary distribution -- the
     // same quantity log_softmax(logits).topk(k) yields, so scores stay
     // comparable across rows.
+    //
+    // Each row is sorted best-first, ties broken on the lower token id, and
+    // callers depend on that: SpecExec and ProactiveDraft read a row's
+    // leading `width` entries as its best `width` children, and ChooseBet
+    // reads slot 0 as the row's argmax. ggml_top_k gives no such guarantee,
+    // so forward_batch_topk() sorts the backend-sampler path itself.
     struct TopKRows {
         int32_t k = 0;
         int32_t n_rows = 0;

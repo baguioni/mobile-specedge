@@ -33,6 +33,9 @@ anything here.
 | `src/metric/mobile.py` | Post-run latency/throughput analysis of the JSONL result logs. |
 | `src/test/` | Unit tests; build with `-DSPECEDGE_BUILD_TESTS=ON`. |
 | `config/client.example.yaml` | Example config for the `client` binary. |
+| `src/topk_sampler.{h,cpp}` | The draft's top-k + full-vocabulary log normalizer as graph nodes, so they run on the model's device (`draft_scoring: backend`). |
+| `src/host_topk.{h,cpp}` | The same scoring on host CPU threads over raw logits (`draft_scoring: host`). |
+| `patches/` | Local llama.cpp patches, applied by hand (see [Building](#building)), plus `UPSTREAM-NOTES.md`: Hexagon backend limits this project works around and why they are worth fixing upstream. |
 | `data/` | Prompt datasets: `mtbench`, `c4`, `oasst`, `wikitext` (JSON `[id, text]` arrays), `specbench` (JSONL chat turns). |
 
 ---
@@ -44,7 +47,7 @@ anything here.
 - **CMake ≥ 3.14** and a **C++17** compiler.
 - **Network access on the first configure** — CMake `FetchContent` downloads and
   builds, pinned by tag:
-  - llama.cpp `b10615`
+  - llama.cpp `b11065` (`ce8caa6e6`)
   - nlohmann/json `v3.11.3`
   - yaml-cpp `0.8.0`
 - **gRPC and Protobuf installed on the system**, discoverable via
@@ -84,7 +87,7 @@ flag: [CUDA](#cuda-build) for an NVIDIA edge box, and
 
 ### CUDA build
 
-Builds the bundled llama.cpp (`b10615`) with its CUDA backend so the draft
+Builds the bundled llama.cpp (`b11065`) with its CUDA backend so the draft
 model runs on an NVIDIA GPU.
 
 **Prerequisites**
@@ -378,6 +381,8 @@ commented list. Key fields:
 | `max_request_num` | `-1` = whole dataset, else absolute upper index |
 | `req_offset`, `sample_req_cnt` | start index, and take every Nth prompt |
 | `n_gpu_layers`, `main_gpu`, `n_threads`, `n_threads_batch` | llama.cpp placement / threading |
+| `hexagon_oppoll` | Hexagon only. `true` sets `GGML_HEXAGON_OPPOLL=1`, so the host spins on the NPU's completion queue instead of sleeping until it interrupts. Removes the per-decode wake-up *and* keeps the core from downclocking while the NPU works, which speeds up the host top-k that follows: draft round 163 → 123 ms, +8.5% throughput, at the cost of a busy core and ~6 °C (`experiments/09-22-26/hexagon-oppoll/`). `null` leaves the backend default. An explicit `GGML_HEXAGON_OPPOLL` in the environment wins. |
+| `draft_scoring` | `host` (default): raw logits come back and `HostTopK` scores them on `n_threads` CPU threads. `backend`: the draft's top-k + full-vocab log normalizer is a sampler inside the decode graph, so only `k` ids and probabilities cross the bus. Keep `host` on Hexagon and OpenCL — OpenCL has no `TOP_K` kernel at all, and Hexagon's (new in `b11065`) is measured at 1.8x slower end to end, see `experiments/09-21-26/q3-npu-backend-sampler/` |
 
 ### Proactive draft
 
@@ -408,6 +413,42 @@ Proactive drafting needs attention-only draft models. With a hybrid draft like
 Qwen3.5 the client refuses to start unless `proactive.type: disabled` (see
 [Models](#models)).
 
+### Replay mode — draft only, no server
+
+`--replay <trace.jsonl>` re-runs an earlier run's requests with the target
+replaced by `OracleValidator` (`src/oracle_validator.h`). Each request is
+re-drafted from its recorded `prompt_tokens`, and every round is judged against
+its recorded `output_tokens`: a draft path is accepted iff it spells the
+recorded continuation, and the bonus token is the next recorded one. No server
+or network is involved, and every backend is scored against the same text. A
+live run can't do that, because the target isn't bit-stable across tree shapes.
+
+```sh
+# on the phone, from /data/local/tmp/specedge
+./client-htp --config replay/baseline-npu.yaml --exp-name replay-npu \
+    --replay replay/baseline-cpu.trace.jsonl
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--replay <path>` | the `trace.jsonl` to replay; requests are visited in its order |
+| `--replay-limit <n>` | only the first `n` requests |
+| `--sim-rtt-ms <ms>` | sleep this long per round in place of the round trip (the proactive window / device idle gap); default 0 |
+| `--exp-name <name>` | override `exp_name` (also works for live runs) |
+
+Engine, tree and proactive settings come from the YAML as usual; `host` and
+`dataset` are ignored. Keep `max_new_tokens` equal to the recorded run's. The
+outputs are the usual files; read them with `draft_breakdown.py` and
+`compare_runs.py`, not `mobile.py`, since there's no `server.jsonl`.
+
+**Self-check.** Replaying a trace with the same backend and config that recorded
+it should reproduce its per-round `num_accepted_tokens` exactly (`compare_runs.py
+<recorded> <replay>`). That holds whatever the target's temperature was, because
+the recorded tokens *are* the target's choices. The client also aborts if a
+committed token ever differs from the reference. A request whose final round
+reaches past the end of the recording gets EOS as its bonus and is marked
+`stop_reason: "reference_end"` in the replay's trace.
+
 ---
 
 ## Output logs
@@ -436,12 +477,16 @@ project root. The `client` binary prints the directory it chose on startup.
   | `context_len` | committed KV depth this round conditions on (prompt + all accepted so far) |
   | `prompt_len` | this request's prompt token count |
   | `draft.n_nodes` | draft tree size shipped to the target; `num_accepted_tokens / draft.n_nodes` is draft efficiency |
+  | `draft.decode` / `.sync` / `.readback` / `.forward_log` | per level, `draft.forward` split into `llama_decode`, `llama_synchronize`, the sampled-row reads, and the `graph-engine.log` write (`src/metric/draft_breakdown.py` reports them) |
 - **`<log dir>/trace.txt`, `<log dir>/trace.jsonl`** — per-request prompt and
   completion, for diffing two runs against each other.
-- **`graph-engine.log`** — per-forward debug log from `LlamaCppEngine`. Goes to
-  the current directory, or to `$SPECEDGE_RESULT_PATH/$SPECEDGE_EXP_NAME/` when
-  both env vars are set — which is exactly what `client` exports from
-  `result_path` / `exp_name`, so it joins the rest of the run's files.
+- **`graph-engine.log`** — per-forward debug log from `LlamaCppEngine`.
+  **Off unless `SPECEDGE_FORWARD_LOG=1` is set**: writing it detokenizes and
+  flushes on every decode, inside the draft's hot path. When on it goes to the
+  current directory, or to `$SPECEDGE_RESULT_PATH/$SPECEDGE_EXP_NAME/` when both
+  env vars are set — which is exactly what `client` exports from `result_path` /
+  `exp_name`, so it joins the rest of the run's files. With it off, the
+  `draft.forward_log` span in the client JSONL reads ~0.
 
 ## Analyzing a run
 

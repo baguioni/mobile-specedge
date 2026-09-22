@@ -60,7 +60,8 @@ ProactiveDraft::ProactiveDraft(
             "and max_budget must all be >= 1");
     }
     // Rows of forward_batch_topk() are strided by the engine's own k and
-    // sorted best-first, so a narrower proactive width is just a prefix of
+    // sorted best-first (the engine sorts explicitly -- ggml_top_k does not
+    // order its output), so a narrower proactive width is just a prefix of
     // each row. A wider one has nowhere to come from.
     if (config_.max_branch_width > engine_.draft_top_k()) {
         throw std::invalid_argument(
@@ -188,7 +189,10 @@ std::optional<ProactiveDraft::Bet> ProactiveDraft::ChooseBet() {
     }
 
     // argmax over beam_score[i] + decay + logprob[i][j]. beam_score is
-    // constant within a leaf, so only each leaf's rank-0 token can win.
+    // constant within a leaf, so only each leaf's rank-0 token can win --
+    // which holds because forward_batch_topk() sorts every row best-first
+    // on both the host and the backend-sampler path. It has to: ggml_top_k
+    // itself promises only the k largest, in no particular order.
     int32_t best_b = -1;
     float best_score = 0.0f;
     for (int32_t b = 0; b < n; ++b) {

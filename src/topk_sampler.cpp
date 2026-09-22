@@ -53,16 +53,38 @@ void SamplerApply(llama_sampler* smpl, llama_token_data_array* cur_p) {
 }
 
 // No probe is exposed to user code (llama_sampler_backend_support is
-// internal), so this asserts support rather than testing for it. Both ops
-// have CUDA kernels that handle vocabulary-width rows: soft_max loops over
-// columns with a shared-memory fallback, and top_k drops to a CUB radix
-// select above 1024 columns. A backend without them fails loudly at graph
-// build rather than silently producing wrong tokens.
+// internal), so this asserts support rather than testing for it. Every op
+// BackendApply emits handles vocabulary-width rows on the backends this
+// project runs on: CUDA, CPU, and -- since llama.cpp ce8caa6e6 -- Hexagon,
+// whose TOP_K kernel takes single rows up to 262144 wide and whose EXP,
+// SUM_ROWS, LOG, SUB and GET_ROWS kernels have no width cap at all. A
+// backend missing one fails loudly at graph build rather than silently
+// producing wrong tokens.
 bool BackendInit(
     llama_sampler* /*smpl*/,
     ggml_backend_buffer_type_t /*buft*/,
     uint32_t /*n_outputs_max_per_seq*/) {
     return true;
+}
+
+// How many rows to fold a `n`-column vocabulary row into before running
+// vocabulary-wide elementwise work over it. Returns the smallest power of two
+// that divides `n` and brings the row under kMaxCols; 1 (no fold) when `n` has
+// no such factor, which still works everywhere except Hexagon.
+//
+// kMaxCols is set from Hexagon's VTCM budget, the tightest of the backends
+// here: a binary op stages 2 source rows + 2 destination rows per thread
+// (double-buffered), so it needs 16 * cols bytes per thread out of 8 MB. At
+// 32768 columns that is 2 MB across 4 threads and 4 MB across 8, both
+// comfortable. Other backends do not care about the shape.
+int64_t fold_rows(int64_t n) {
+    constexpr int64_t kMaxCols = 32768;
+    for (int64_t rows = 1; rows <= n; rows *= 2) {
+        if (n % rows == 0 && n / rows <= kMaxCols) {
+            return rows;
+        }
+    }
+    return 1;
 }
 
 void BackendApply(
@@ -71,17 +93,60 @@ void BackendApply(
     ggml_cgraph* gf,
     llama_sampler_data* data) {
     auto* sctx = static_cast<TopKLogprobCtx*>(smpl->ctx);
+    const int32_t k = sctx->k;
 
     // data->logits arrives as a view of one output row's full-vocab logits.
-    ggml_tensor* logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+    const int64_t n = ggml_nelements(data->logits);
+    ggml_tensor* logits = ggml_reshape_1d(ctx, data->logits, n);  // [n]
+    ggml_tensor* lrows = ggml_reshape_2d(ctx, logits, 1, n);      // [1, n]
 
-    // The whole point: normalize across the full vocabulary *before*
-    // selecting, so the k survivors carry comparable probabilities.
-    ggml_tensor* probs = ggml_soft_max(ctx, logits);
-    ggml_set_name(probs, "logprob_topk_softmax");
-
-    ggml_tensor* top_k = ggml_top_k(ctx, probs, sctx->k);
+    // Select first, normalize second. This is *not* the same order as the
+    // Python reference's log_softmax(...).topk(...), but it gives the same
+    // answer: softmax is monotonic, so the k largest probabilities sit on
+    // the k largest logits, and the normalizer below is still taken over
+    // the whole vocabulary. What it buys is that no op in this graph is
+    // wider than the backend can take -- in particular ggml_soft_max, which
+    // Hexagon rejects above 131072 columns (SOFTMAX_MAX_ROW_SIZE in
+    // ggml-hexagon.cpp) while every Qwen3 vocabulary is wider than that:
+    // 151936 for 0.6B, 248320 for the 3.5 hybrid. A soft_max here falls
+    // back to the CPU and splits the graph, which drags the full-vocab
+    // logits across the bus -- the exact copy this sampler exists to avoid.
+    ggml_tensor* top_k = ggml_top_k(ctx, logits, k);              // [k] i32
     ggml_set_name(top_k, "logprob_topk_indices");
+
+    ggml_tensor* top_logits = ggml_get_rows(ctx, lrows, top_k);   // [1, k]
+    ggml_set_name(top_logits, "logprob_topk_logits");
+
+    // log Z = log sum_v exp(logit_v - m) + m, with m the largest logit.
+    // m is taken over the k survivors rather than the vocabulary: the
+    // global maximum is in the top-k set by construction, so this is exact
+    // and costs a k-wide reduction instead of a second full-vocab pass.
+    // ggml_top_k gives no ordering guarantee, hence the reduction rather
+    // than reading slot 0.
+    ggml_tensor* top_flat = ggml_reshape_1d(ctx, top_logits, k);       // [k]
+    ggml_tensor* top_rows = ggml_reshape_2d(ctx, top_flat, 1, k);      // [1, k]
+    ggml_tensor* max_idx = ggml_top_k(ctx, top_flat, 1);               // [1] i32
+    ggml_tensor* max_logit = ggml_get_rows(ctx, top_rows, max_idx);    // [1, 1]
+    ggml_set_name(max_logit, "logprob_topk_max");
+
+    // The elementwise and reduce ops below run over the whole vocabulary, so
+    // their shape decides whether they fit on the device. Hexagon's kernels
+    // stage a *whole row* in VTCM -- for a binary op, two source rows and a
+    // destination row, double-buffered, times the DSP's thread count. At
+    // 151936 columns that is 2.4 MB per thread against 8 MB of VTCM, so the
+    // op is rejected at run time with VTCM-TOO-SMALL and the graph splits
+    // back to the CPU. Folding the row into `n_rows` shorter ones keeps the
+    // arithmetic identical (these ops are elementwise, and sum_rows over the
+    // folded shape is just a partial sum that the second sum_rows finishes)
+    // while bringing each staged row down to tens of KB.
+    const int64_t n_rows = fold_rows(n);
+    ggml_tensor* folded = ggml_reshape_2d(ctx, logits, n / n_rows, n_rows);
+    ggml_tensor* shifted = ggml_sub(ctx, folded, max_logit);
+    ggml_tensor* partial = ggml_sum_rows(ctx, ggml_exp(ctx, shifted));  // [1, n_rows]
+    ggml_tensor* summed =
+        ggml_sum_rows(ctx, ggml_reshape_2d(ctx, partial, n_rows, 1));   // [1, 1]
+    ggml_tensor* log_z = ggml_add(ctx, ggml_log(ctx, summed), max_logit);
+    ggml_set_name(log_z, "logprob_topk_logz");
 
     // Same gather pattern as llama.cpp's stock top-k sampler: a prior
     // sampler in the chain may already have narrowed the candidate set, in
@@ -96,13 +161,15 @@ void BackendApply(
     }
     ggml_set_name(data->candidates, "logprob_topk_candidates");
 
-    ggml_tensor* prob_rows = ggml_reshape_2d(ctx, probs, 1, probs->ne[0]);
-    data->probs = ggml_get_rows(ctx, prob_rows, top_k);
+    // Full-vocabulary probabilities of the k survivors. The caller takes
+    // std::log of these (graph_engine.cpp), so this stays probabilities
+    // rather than log-probabilities: exp-then-log round trips exactly as
+    // well as the softmax-then-log it replaces, and keeps the readback
+    // path unchanged.
+    data->probs = ggml_exp(ctx, ggml_sub(ctx, top_logits, log_z));     // [1, k]
     ggml_set_name(data->probs, "logprob_topk_probs");
 
-    ggml_tensor* logit_rows = ggml_reshape_2d(ctx, logits, 1, logits->ne[0]);
-    data->logits = ggml_get_rows(ctx, logit_rows, top_k);
-    ggml_set_name(data->logits, "logprob_topk_logits");
+    data->logits = top_logits;
 
     GGML_UNUSED(gf);
 }

@@ -5,10 +5,12 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -36,7 +38,20 @@ std::filesystem::path forward_log_path() {
     return log_dir / "graph-engine.log";
 }
 
+// The per-forward log detokenizes, serializes and flushes on every decode,
+// inside the span forward_batch_topk() times as `log_ms`. That is debug
+// instrumentation in the draft's hot path, so it is opt-in: set
+// SPECEDGE_FORWARD_LOG=1. When unset the engine holds a null stream and
+// log_forward{,_topk}() return immediately.
+bool forward_log_enabled() {
+    const char* flag = std::getenv("SPECEDGE_FORWARD_LOG");
+    return flag != nullptr && flag[0] != '\0' && std::strcmp(flag, "0") != 0;
+}
+
 std::shared_ptr<std::ofstream> get_forward_log_stream() {
+    if (!forward_log_enabled()) {
+        return nullptr;
+    }
     std::filesystem::path path = forward_log_path();
     std::lock_guard<std::mutex> lock(g_forward_log_mutex);
     auto it = g_forward_logs.find(path.string());
@@ -598,6 +613,18 @@ LlamaCppEngine::TopKRows LlamaCppEngine::forward_batch_topk(
         host_topk_->Run(rows, out.ids.data(), out.logprobs.data());
     }
 
+    // Scratch for the per-row sort below; allocated once per call rather
+    // than per row. Empty on the host-top-k path, which sorts for itself.
+    std::vector<int32_t> order;
+    std::vector<llama_token> sorted_ids;
+    std::vector<float> sorted_logprobs;
+    if (!host_topk_ && n > 0) {
+        order.resize(static_cast<size_t>(draft_top_k_));
+        std::iota(order.begin(), order.end(), 0);
+        sorted_ids.resize(static_cast<size_t>(draft_top_k_));
+        sorted_logprobs.resize(static_cast<size_t>(draft_top_k_));
+    }
+
     for (int32_t i = 0; i < n && !host_topk_; ++i) {
         const llama_token* candidates = llama_get_sampled_candidates_ith(ctx_, i);
         const float* probs = llama_get_sampled_probs_ith(ctx_, i);
@@ -613,13 +640,39 @@ LlamaCppEngine::TopKRows LlamaCppEngine::forward_batch_topk(
                 "forward_batch_topk: sampler returned " + std::to_string(n_cand) +
                 " candidates, expected " + std::to_string(draft_top_k_));
         }
+        const size_t base = static_cast<size_t>(i) * draft_top_k_;
         for (int32_t j = 0; j < draft_top_k_; ++j) {
-            const size_t f = static_cast<size_t>(i) * draft_top_k_ + j;
-            out.ids[f] = candidates[j];
+            out.ids[base + j] = candidates[j];
             // The sampler normalizes over the whole vocabulary before
             // selecting, so this log is the full-vocab log-probability --
             // identical to logit - log_z, and comparable across rows.
-            out.logprobs[f] = std::log(probs[j]);
+            out.logprobs[base + j] = std::log(probs[j]);
+        }
+
+        // ggml_top_k promises the k largest, not their order -- ggml-cpu
+        // even swaps the first two slots on purpose to say so. TopKRows is
+        // documented as best-first and callers rely on it: ProactiveDraft
+        // takes the first `proactive_max_branch_width` of each row as "the
+        // best ones" (proactive_draft.cpp). So sort here. k is the sampler
+        // width, 16 in the shipped configs, so this is a few dozen compares
+        // per row inside a span that costs milliseconds. Ties break on the
+        // lower token id, matching HostTopK, so both paths agree exactly.
+        std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+            const float pa = out.logprobs[base + a];
+            const float pb = out.logprobs[base + b];
+            if (pa != pb) {
+                return pa > pb;
+            }
+            return out.ids[base + a] < out.ids[base + b];
+        });
+        for (int32_t j = 0; j < draft_top_k_; ++j) {
+            sorted_ids[j] = out.ids[base + order[j]];
+            sorted_logprobs[j] = out.logprobs[base + order[j]];
+        }
+        for (int32_t j = 0; j < draft_top_k_; ++j) {
+            out.ids[base + j] = sorted_ids[j];
+            out.logprobs[base + j] = sorted_logprobs[j];
+            order[j] = j;
         }
     }
     const Clock::time_point t_read = Clock::now();

@@ -84,16 +84,37 @@ struct ClientConfig {
     // the decode graph, topk_sampler.h) or "host" (HostTopK over the raw
     // logits, host_topk.h). See LlamaCppEngine::Config::host_topk.
     //
-    // Default is "host": the backend path's ggml_top_k has no ordering
-    // guarantee (ggml-cpu deliberately swaps its first two output slots --
-    // see ggml_compute_forward_top_k_f32 -- and OpenCL/Hexagon have no
-    // TOP_K kernel at all, so they fall back to that same CPU op), while
-    // ProactiveDraft::ChooseBet reads row index 0 assuming it is the best
-    // candidate. On the backend path that assumption does not hold, so
-    // ChooseBet can bet on the wrong token. host_topk's HostTopK::Run()
-    // genuinely sorts its output, and benchmarked faster on-device at the
-    // repo's configured n_rows=32/draft_top_k=16 besides.
+    // Default is "host". "backend" needs a TOP_K kernel on the target device
+    // or the graph splits and the full-vocab logits cross the bus anyway --
+    // the whole cost it exists to avoid. OpenCL has no TOP_K kernel at all.
+    // Hexagon gained one in llama.cpp b11065 (ce8caa6e6, the current pin)
+    // and the sampler then runs entirely on HTP0 at 2 graph splits, but it
+    // is still the slower path: 328 ms per draft round against host top-k's
+    // 183, because that kernel costs 1918 us per 151936-wide row. See
+    // experiments/09-21-26/q3-npu-backend-sampler/README.md.
+    //
+    // ggml_top_k's unordered output is not a reason to avoid it any more:
+    // forward_batch_topk() sorts each row best-first on both paths (see
+    // graph_engine.cpp), which is what ProactiveDraft and SpecExec's
+    // width-prefix reads require.
     std::string draft_scoring = "host";
+
+    // Sets GGML_HEXAGON_OPPOLL, which decides how the host waits for the NPU
+    // to finish a batch: asleep until an interrupt (the backend's default),
+    // or spinning on the completion queue. Spinning removes the wake-up
+    // latency -- about 5.8 ms of the ~8 ms fixed cost every llama_decode
+    // pays, four times a draft round -- and, less obviously, keeps the core
+    // from being downclocked while the NPU works, so the host-side top-k
+    // that runs straight afterwards does not have to ramp back up. Measured
+    // on Qwen3-0.6B-Q8_0 over HTP0: draft round 163 to 123 ms, throughput
+    // +8.5% (experiments/09-22-26/hexagon-oppoll/).
+    //
+    // It is opt-in because it costs a spinning core: the same runs ended
+    // 6 C hotter, and HTP decode is known to degrade under sustained heat.
+    // Null leaves the backend's own default alone. Ignored by non-Hexagon
+    // backends, and an explicit GGML_HEXAGON_OPPOLL in the environment
+    // always wins, which is what the A/B scripts rely on.
+    std::optional<bool> hexagon_oppoll;
 
     // target + decoding (SpecExec drafting parameters, see
     // spec_exec_client.h)
@@ -184,6 +205,9 @@ ClientConfig load_config(const std::string& path) {
     }
     if (cl["flash_attn"] && !cl["flash_attn"].IsNull()) {
         c.flash_attn = cl["flash_attn"].as<bool>();
+    }
+    if (cl["hexagon_oppoll"] && !cl["hexagon_oppoll"].IsNull()) {
+        c.hexagon_oppoll = cl["hexagon_oppoll"].as<bool>();
     }
     c.draft_scoring = node_or<std::string>(cl["draft_scoring"], c.draft_scoring);
     if (c.draft_scoring != "backend" && c.draft_scoring != "host") {
@@ -740,6 +764,15 @@ int main(int argc, char** argv) {
             ::setenv("SPECEDGE_EXP_NAME", cfg.exp_name.c_str(), /*overwrite=*/1);
         }
         std::fprintf(stderr, "Writing results to %s/\n", log_dir.c_str());
+
+        // Same handoff, and for the same reason: the Hexagon backend reads
+        // its environment once, in ggml_hexagon_init(), which runs the first
+        // time anything touches the backend registry -- inside the engine
+        // constructor below. overwrite=0 so an explicit setting in the
+        // environment still wins.
+        if (cfg.hexagon_oppoll.has_value()) {
+            ::setenv("GGML_HEXAGON_OPPOLL", *cfg.hexagon_oppoll ? "1" : "0", /*overwrite=*/0);
+        }
 
         specedge::LlamaCppEngine::Config engine_config;
         engine_config.model_path = cfg.draft_model;
