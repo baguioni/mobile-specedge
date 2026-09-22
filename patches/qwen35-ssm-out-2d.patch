@@ -1,0 +1,27 @@
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index a1e263500..2a8943da6 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -453,17 +453,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     // Apply gated normalization: self.norm(core_attn_out, z)
+     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+ 
+-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
+-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
++    // Flatten the sequence dim into rows: ssm_out is 2D, so [K, n_tokens, n_seqs] and
++    // [K, n_tokens * n_seqs] produce identical output bytes. Keeping the projection a plain
++    // 2D mul_mat lets backends that reject 3D activations (e.g. the Hexagon quantized path)
++    // run it instead of falling back to CPU.
++    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
+     cb(final_output, "final_output", il);
+ 
+     // Output projection
+     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+     cb(cur, "linear_attn_out", il);
+ 
+-    // Reshape back to original dimensions
+-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
+-
+     return cur;
+ }
+ 

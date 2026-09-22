@@ -10,14 +10,19 @@ endif()
 include(FetchContent)
 
 # Pin to a released tag so builds are reproducible; bump deliberately.
-# 5202104b5 (2026-09-07): picks up ~10 ggml-hexagon commits over b10615
-# (f280b2698), including the fully-async HTP backend (#26501) and MUL_MAT
+# ce8caa6e6 (2026-09-20, upstream master when bumped from 5202104b5).
+# 5202104b5 (2026-09-07) brought the fully-async HTP backend (#26501) and MUL_MAT
 # fusion (#28202) -- see mobile-specedge/experiments/09-11-26/npu-host-topk-results.md
 # for the ~1.6x draft-round speedup this was already measured to give.
+# NOTE: patches/qwen35-ssm-out-2d.patch is NOT applied by FetchContent. Without it
+# Qwen3.5's delta-net output projection falls back to the CPU on Hexagon/OpenCL
+# (~2x slower draft round). The build/build_project_android_hexagon_*.sh scripts pass
+# FETCHCONTENT_SOURCE_DIR_LLAMA_CPP=build/llama_cpp-<sha>-src, a tree with the patch
+# already applied; apply it by hand (patch -p1) when re-provisioning that tree.
 FetchContent_Declare(
   llama_cpp
 GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-GIT_TAG        5202104b59ada9005db079eea43882a2b7bf5802
+GIT_TAG        ce8caa6e60a03093351d6016a818720e0d46f0fb
 GIT_SHALLOW    TRUE
 )
 

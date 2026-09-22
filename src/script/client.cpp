@@ -170,7 +170,10 @@ void print_usage(const char* argv0) {
         "  --replay <path>       draft-only replay of a recorded run's trace.jsonl: no\n"
         "                        target server, the recorded completions judge each\n"
         "                        round (see src/oracle_validator.h)\n"
-        "  --replay-limit <n>    replay only the trace's first n requests\n"
+        "  --replay-limit <n>    replay only the first n requests, after striding\n"
+        "                        (dataset.sample_req_cnt in the client config also\n"
+        "                        applies to --replay: every Nth surviving request,\n"
+        "                        no offset)\n"
         "  --sim-rtt-ms <ms>     replay: sleep this long per round in place of the\n"
         "                        target round trip (default 0)\n"
         "  -h, --help            Show this message\n",
@@ -596,8 +599,18 @@ struct ReplayRequest {
 // visited its requests -- so a replay meets them in the same sequence and
 // the draft device goes through the same load history. Requests the
 // recorded run skipped, or that produced nothing, have no reference and are
-// dropped. limit < 0 keeps every request.
-std::vector<ReplayRequest> load_replay_trace(const std::string& path, int32_t limit) {
+// dropped.
+//
+// sample_req_cnt takes every Nth surviving request, same semantics as
+// client.py's dataset.sample_req_cnt on the live path (mirrors specedge-
+// modified's dataset_indices[::sample_req_cnt]) -- applied over file order,
+// not req_idx, so it stays a stride on the sequence a replay actually
+// walks rather than a reconstruction of some other run's own shuffle. No
+// offset: the trace is the full dataset, and there is no earlier "skip
+// these" boundary to reproduce here. limit < 0 keeps every (strided)
+// request; limit caps the count after striding, not before.
+std::vector<ReplayRequest> load_replay_trace(
+    const std::string& path, int32_t limit, int32_t sample_req_cnt) {
     std::ifstream f(path);
     if (!f) {
         throw std::runtime_error("could not open replay trace " + path);
@@ -621,9 +634,16 @@ std::vector<ReplayRequest> load_replay_trace(const std::string& path, int32_t li
             continue;
         }
         requests.push_back(std::move(r));
-        if (limit >= 0 && static_cast<int32_t>(requests.size()) >= limit) {
-            break;
+    }
+    if (sample_req_cnt > 1) {
+        std::vector<ReplayRequest> strided;
+        for (size_t i = 0; i < requests.size(); i += static_cast<size_t>(sample_req_cnt)) {
+            strided.push_back(std::move(requests[i]));
         }
+        requests = std::move(strided);
+    }
+    if (limit >= 0 && static_cast<int32_t>(requests.size()) > limit) {
+        requests.resize(static_cast<size_t>(limit));
     }
     if (requests.empty()) {
         throw std::runtime_error("replay trace " + path + " has no usable requests");
@@ -644,7 +664,8 @@ int run_replay(
     specedge::LlamaCppEngine& engine,
     const std::string& log_dir,
     const ReplayOptions& opts) {
-    const std::vector<ReplayRequest> requests = load_replay_trace(opts.trace_path, opts.limit);
+    const std::vector<ReplayRequest> requests =
+        load_replay_trace(opts.trace_path, opts.limit, cfg.sample_req_cnt);
     const llama_vocab* vocab = engine.vocab();
 
     TraceWriter trace(log_dir);
